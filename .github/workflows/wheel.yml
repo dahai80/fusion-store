@@ -1,0 +1,30 @@
+# fusion-store Python wheel 构建 [v2 PRD-plan §771 #4]
+# fs-ffi-py（PyO3）arm64 wheel —— maturin build。push tag v* 触发，手工 workflow_dispatch 可跑。
+# 落地 PRD §771 #4：M3 先 maturin develop 本地用，CI 发布 arm64 wheel 纳入 M4。
+name: wheel
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  macos-arm64:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install maturin
+        run: pip install 'maturin>=1.4,<2.0'
+      - name: Build wheel (fs-ffi-py, arm64)
+        working-directory: crates/fs-ffi-py
+        run: maturin build --release --interpreter python3
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fusion-store-whl-macos-arm64
+          path: crates/fs-ffi-py/target/wheels/*.whl
+          if-no-files-found: error

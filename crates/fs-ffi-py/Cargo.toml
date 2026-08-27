@@ -1,0 +1,19 @@
+[package]
+name = "fs-ffi-py"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+name = "fusion_store"
+
+[dependencies]
+fs-core = { path = "../fs-core" }
+pyo3 = { version = "0.29", features = ["extension-module"] }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }

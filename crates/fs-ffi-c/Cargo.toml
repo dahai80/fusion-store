@@ -1,0 +1,17 @@
+[package]
+name = "fs-ffi-c"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["staticlib", "cdylib", "rlib"]
+name = "fusion_store"
+
+[dependencies]
+fs-core = { path = "../fs-core" }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

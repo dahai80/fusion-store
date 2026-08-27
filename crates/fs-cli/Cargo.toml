@@ -1,0 +1,19 @@
+[package]
+name = "fs-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+fs-core = { path = "../fs-core" }
+fs-serve = { path = "../fs-serve" }
+clap = { version = "4", features = ["derive", "env"] }
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+
+[dev-dependencies]
+tempfile = { workspace = true }

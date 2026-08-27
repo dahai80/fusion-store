@@ -1,0 +1,37 @@
+[workspace]
+members = [
+    "crates/fs-core",
+    "crates/fs-cli",
+    "crates/fs-ffi-c",
+    "crates/fs-ffi-py",
+    "crates/fs-serve",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.94"
+license = "MIT"
+
+[workspace.dependencies]
+# 核心存储
+memmap2 = "0.9"
+heed = "0.21"
+arrow = "54"
+# 错误/日志/序列化
+thiserror = "2"
+tracing = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bytemuck = "1"
+# 多进程写锁
+fs2 = "0.4"
+# 测试
+criterion = "0.5"
+tempfile = "3"
+proptest = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

@@ -1,0 +1,25 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: rustup toolchain
+        run: rustup toolchain install 1.94 --profile minimal && rustup default 1.94
+      - name: cargo fmt
+        run: cargo fmt --check
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: cargo check
+        run: cargo check --workspace --all-targets
+      - name: cargo test
+        run: cargo test --workspace
