@@ -4,6 +4,16 @@ fusion-store 版本变更记录。格式遵循 [Keep a Changelog](https://keepac
 
 ## [Unreleased]
 
+## [0.2.0-rc.2] — 2026-08-28 (Pre-release)
+
+### 定位
+
+**0.2 线第二个 Release Candidate** —— NSW 规模演进 Path A（`ShardedEngine` 分片薄层）落地候选。
+
+- 在 rc.1 基线之上落地 `ShardedEngine`，对消费方提供分片多 namespace 编排能力（fan-out 检索 + 路由写 + 归并 top-k），不改 `NswGraph` 核心（Path A 立场）。
+- A4 单 namespace 立场不变：`ShardedEngine` 是消费方侧多 `Engine` 编排，非单引擎内多 namespace 路由。
+- **Pre-release**：受控商用 / 技术预览档，不建议直接无条件企业级生产商用。下一稳定锚点 0.2.0。
+
 ### NSW 规模演进 Path A 落地
 - `ShardedEngine` 分片薄层（`crates/fs-core/src/sharded.rs`）—— 持 K 个 `Engine`（各独立目录 + WAL + flock），完整 impl `FusionStoreEngine`，对消费方透明。
   - 路由：`ShardRouter` trait + 默认 `HashRouter`（向量 id % K / KV key fnv-1a % K），可注入业务键路由免 fan-out。
@@ -12,6 +22,18 @@ fusion-store 版本变更记录。格式遵循 [Keep a Changelog](https://keepac
   - 生命周期：checkpoint/recover/close 全分片顺序调用，任一失败立返 Err。
 - 9 集成测试（`tests/test_sharded.rs`）：多分片建库/路由往返/fan-out 召回 vs 暴力 top-k/batch 分摊/delete+get 路由/list 合并/checkpoint 重开持久化/count 聚合。141 测试 debug+release 双绿。
 - 不改 `NswGraph` 核心（Path A 立场），A4 单 namespace 立场不变（ShardedEngine 是消费方侧多 Engine 编排）。
+
+### 已知限制（沿用 rc.1）
+
+- 单层 NSW，无分层/分片，单 namespace 向量数软上限 ≤1-2M（`/stats` `vector_count` 暴露水位）。
+- 零拷贝仅 Rust 进程内；C/Python 经 C-ABI 读强制拷贝（A7）。
+- 单 namespace = 单 `Engine` 实例；多 namespace 是消费方职责（A4），`ShardedEngine` 是可选薄层封装。
+- `ShardedEngine` 不做跨分片原子（2PC 超薄层范围），K 增长时 fd/mmap 随之膨胀。
+
+### CI / 产物
+
+- GitHub Actions runner 仍被账户 billing 阻断（非代码问题），wheel 产物暂不可自动构建。
+- tag `v0.2.0-rc.2` + GitHub Pre-release 已落地。billing 解后 `gh run rerun` 触发 wheel。
 
 ## [0.2.0-rc.1] — 2026-08-28 (Pre-release)
 

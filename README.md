@@ -86,7 +86,7 @@ pub trait FusionStoreEngine {
 
 ## 状态
 
-Greenfield → M0 完成（workspace 骨架 + fs-core trait）。M1 完成（KV + mmap 段）。M2 完成（NSW 图常驻 RAM + snapshot + NEON SIMD 位等 + batch）。M3 完成（Arrow 定长原语列式 + C-ABI + 读强制拷贝 + Python 绑定 fs-ffi-py）。M4 完成（WAL 幂等 + recover + compact COW + fs-serve + 背压 + prometheus + SLA）。审计 30 缺陷全修复（A1-A7 / R1-R10 / E1-E13）+ 生产就绪审计 P0-P3 全修复（见审计纠偏节）。PRD v2.0 roadmap 全里程碑 + 全延后项落地，141 测试全绿（debug + release 双绿，含 9 例 proptest fuzz harness F-TEST-2 + 1 例非环回启动门禁 F-SEC-1 + 9 例 ShardedEngine 分片测试；fs-ffi-py 7 Python 测试另计，maturin 开发环境）。**当前 0.2.0-rc.1（Pre-release，0.2 线 RC 基线）** —— 受控商用 / 技术预览档达标（审计 P0/P1 闭环）；NSW 规模演进 Path A `ShardedEngine` 分片薄层已落地（见下节），排入 0.2.0-rc.2 → 0.2.0。向量读取/枚举 API（`get_vector`/`list_vector_ids`）+ 删除 API 经 Engine trait → C-ABI → Python 三层全暴露（#2/#3）。RBAC + audit log + token file + body limit + /stats 认证门禁 + 非环回无 token 拒启动 hard fail（F-SEC-2/F-SEC-7/F-SEC-1/F-OPS-8）。
+Greenfield → M0 完成（workspace 骨架 + fs-core trait）。M1 完成（KV + mmap 段）。M2 完成（NSW 图常驻 RAM + snapshot + NEON SIMD 位等 + batch）。M3 完成（Arrow 定长原语列式 + C-ABI + 读强制拷贝 + Python 绑定 fs-ffi-py）。M4 完成（WAL 幂等 + recover + compact COW + fs-serve + 背压 + prometheus + SLA）。审计 30 缺陷全修复（A1-A7 / R1-R10 / E1-E13）+ 生产就绪审计 P0-P3 全修复（见审计纠偏节）。PRD v2.0 roadmap 全里程碑 + 全延后项落地，141 测试全绿（debug + release 双绿，含 9 例 proptest fuzz harness F-TEST-2 + 1 例非环回启动门禁 F-SEC-1 + 9 例 ShardedEngine 分片测试；fs-ffi-py 7 Python 测试另计，maturin 开发环境）。**当前 0.2.0-rc.2（Pre-release，0.2 线 RC）** —— 受控商用 / 技术预览档达标（审计 P0/P1 闭环）；NSW 规模演进 Path A `ShardedEngine` 分片薄层已落地（见下节，rc.2 候选），下一步 0.2.0 稳定。向量读取/枚举 API（`get_vector`/`list_vector_ids`）+ 删除 API 经 Engine trait → C-ABI → Python 三层全暴露（#2/#3）。RBAC + audit log + token file + body limit + /stats 认证门禁 + 非环回无 token 拒启动 hard fail（F-SEC-2/F-SEC-7/F-SEC-1/F-OPS-8）。
 
 ### 审计纠偏（A2/A4/A7/E6）
 
