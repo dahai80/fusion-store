@@ -9,17 +9,67 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  check:
+  fmt-clippy-test:
+    name: fmt + clippy + test (${{ matrix.os }}, rust ${{ matrix.rust }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-13]
+        rust: ["1.94", "stable"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: rustup toolchain
+        run: rustup toolchain install ${{ matrix.rust }} --profile minimal && rustup default ${{ matrix.rust }}
+      - name: cargo fmt
+        run: cargo fmt --check
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --exclude fs-ffi-py -- -D warnings
+      - name: cargo check
+        run: cargo check --workspace --all-targets --exclude fs-ffi-py
+      - name: cargo test
+        run: cargo test --workspace --exclude fs-ffi-py
+
+  # fs-ffi-py 单独编译检查（pyo3 cdylib，无 Rust 测试，Python 测试见 python-binding job）
+  ffi-py-build:
+    name: fs-ffi-py compile check
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
       - name: rustup toolchain
         run: rustup toolchain install 1.94 --profile minimal && rustup default 1.94
-      - name: cargo fmt
-        run: cargo fmt --check
-      - name: cargo clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: cargo check
-        run: cargo check --workspace --all-targets
-      - name: cargo test
-        run: cargo test --workspace
+      - name: cargo clippy fs-ffi-py
+        run: cargo clippy -p fs-ffi-py --all-targets -- -D warnings
+      - name: cargo test fs-ffi-py (0 rust tests, compile only)
+        run: cargo test -p fs-ffi-py
+
+  # Python 绑定测试（maturin develop + pytest test_binding.py）
+  python-binding:
+    name: Python binding tests
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: rustup toolchain
+        run: rustup toolchain install 1.94 --profile minimal && rustup default 1.94
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install maturin + numpy + pytest
+        run: pip install 'maturin>=1.4,<2.0' numpy pytest
+      - name: maturin develop
+        working-directory: crates/fs-ffi-py
+        run: maturin develop
+      - name: pytest test_binding.py
+        working-directory: crates/fs-ffi-py
+        run: python -m pytest tests/test_binding.py -v
+
+  # 全规模基准趋势门禁（50K×768，验召回/延迟趋势，非 1M 全量——1M 人工定期跑）
+  bench-scale:
+    name: Scale bench trend gate (50K)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: rustup toolchain
+        run: rustup toolchain install 1.94 --profile minimal && rustup default 1.94
+      - name: cargo run bench (50K×768, release)
+        run: FS_BENCH_N=50000 FS_BENCH_DIM=768 cargo run --release -p fs-core --example full_scale_bench

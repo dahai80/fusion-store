@@ -13,6 +13,11 @@ pub mod mem;
 pub mod store;
 pub mod vector;
 
+/// heed EnvOpenOptions 的 max_dbs 共享常量（F-PERF-8）。
+/// KV / Vector / Columnar 三 store 各开独立 heed env，max_dbs 上限统一为 8，
+/// 提名为常量防三处魔数漂移（任一处改小 → create_database 漏库 panic）。
+pub const HEED_MAX_DBS: u32 = 8;
+
 pub use compact::{reclaim, run_compact, CompactResult};
 pub use engine::FusionStoreEngine;
 pub use engine_impl::Engine;

@@ -24,3 +24,4 @@ columnar = ["dep:arrow"]
 [dev-dependencies]
 tempfile = { workspace = true }
 tracing = { workspace = true }
+proptest = { workspace = true }

@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- fusion-store fs-serve launchd 服务定义（F-OPS-6 部署配置） -->
+<!-- macOS 开机自启 + 进程守护 + 崩溃自动重启 -->
+<!-- 安装：
+   sudo cp deploy/fusion-store.plist /Library/LaunchDaemons/com.fusion.store.plist
+   sudo launchctl load /Library/LaunchDaemons/com.fusion.store.plist
+   启动：sudo launchctl start com.fusion.store
+   停止：sudo launchctl unload /Library/LaunchDaemons/com.fusion.store.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.fusion.store</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/fusion-store</string>
+        <string>serve</string>
+        <string>--home</string>
+        <string>/var/lib/fusion-store</string>
+        <string>--port</string>
+        <string>11463</string>
+        <string>--bind</string>
+        <string>127.0.0.1</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUST_LOG</key>
+        <string>info</string>
+        <!-- FS_AUTH_TOKEN 写入 /etc/fusion-store/env 后用 EnvFilePath，或此处明文（生产建议文件读取） -->
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/var/log/fusion-store.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/fusion-store.err.log</string>
+
+    <key>UserName</key>
+    <string>root</string>
+</dict>
+</plist>

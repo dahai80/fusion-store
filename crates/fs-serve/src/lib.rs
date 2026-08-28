@@ -10,6 +10,7 @@
 
 pub mod metrics;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::{
@@ -35,6 +36,9 @@ pub const DEFAULT_PORT: u16 = 11463;
 pub const WRITE_WORKERS: usize = 4;
 /// R4：KNN 并发上限（blocking 线程数硬顶，防突发 1000 并发 OOM）
 pub const KNN_CONCURRENCY: usize = 64;
+/// F-SEC-7：HTTP 请求体上限（16MB，覆盖 Arrow IPC 批 + 向量批量写，拒超大 payload DoS）。
+/// 16MB 远超单批列式/向量写入常态；超限 axum 返 413 Payload Too Large，反序列化前拦截。
+pub const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 /// 写请求（入队，后台 worker 池消费经 Engine 写 WAL + 落段）
 /// E10：枚举补全 InsertVector + PutColumnar，HTTP API 与底座对齐
@@ -56,8 +60,90 @@ pub enum WriteReq {
     },
 }
 
+/// F-SEC-2：RBAC 角色 —— admin（全权，含 compact/管理）/ readwrite（KV+向量写，禁 compact）
+/// / readonly（仅读 KNN/stats）。FS_AUTH_TOKEN 默认映射 admin（向后兼容单 token 场景）。
+/// 角色经独立 env token 命名：FS_AUTH_TOKEN(admin) / FS_AUTH_TOKEN_RW / FS_AUTH_TOKEN_RO。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AuthRole {
+    Readonly = 0,
+    Readwrite = 1,
+    Admin = 2,
+}
+
+impl AuthRole {
+    fn label(self) -> &'static str {
+        match self {
+            AuthRole::Admin => "admin",
+            AuthRole::Readwrite => "readwrite",
+            AuthRole::Readonly => "readonly",
+        }
+    }
+}
+
+/// F-SEC-2：认证配置 —— token→role 映射表。空表 = 匿名放行（仅环回部署安全）。
+/// 任一 token 命中即返其角色；不命中或未带 token 在「需认证端点」拒 401。
+/// F-SEC-3：token 来源经 main 从 env / FS_AUTH_TOKEN_FILE 载入，本结构不关心来源。
+pub struct AuthConfig {
+    /// token 字符串 → 角色。常量时间比较见 token_match。
+    tokens: HashMap<String, AuthRole>,
+}
+
+impl AuthConfig {
+    pub fn empty() -> Self {
+        Self {
+            tokens: HashMap::new(),
+        }
+    }
+
+    /// 登记一个 token→role（main 启动时从 env 文件载入后调）
+    pub fn add(&mut self, token: String, role: AuthRole) {
+        self.tokens.insert(token, role);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tokens.is_empty()
+    }
+
+    /// 校验 Bearer header → 命中返角色，未配置返 None（匿名放行），配置但未命中/不符返 None + 标记需拒。
+    /// 返 (matched_role, configured)：configured=false 表无 token 配置 → 匿名放行（admin 默认）。
+    fn check(&self, headers: &HeaderMap) -> (Option<AuthRole>, bool) {
+        if self.tokens.is_empty() {
+            return (None, false);
+        }
+        let Some(raw) = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+        else {
+            return (None, true);
+        };
+        let Some(tok) = raw.strip_prefix("Bearer ") else {
+            return (None, true);
+        };
+        // 常量时间比较：逐 token 比对（token 集合小，遍历开销可忽略）。
+        // 不用 HashMap::get（哈希短路泄露前缀），改为遍历 constant_eq。
+        for (stored, role) in &self.tokens {
+            if constant_eq(tok.as_bytes(), stored.as_bytes()) {
+                return (Some(*role), true);
+            }
+        }
+        (None, true)
+    }
+}
+
+/// 常量时间字节比较（防时序侧信道泄露 token 前缀）
+fn constant_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 /// 共享状态 —— 持 Engine + 写队列深度 + compact 标志 + 写队列 sender + 队列上限
-/// + KNN 信号量（R4）+ auth token（R10）
+/// + KNN 信号量（R4）+ auth（R10/F-SEC-2 RBAC）+ bind 是否环回（F-OPS-8 /stats 守门）
 pub struct AppState {
     pub engine: Arc<Engine>,
     pub queue_depth: Arc<std::sync::atomic::AtomicUsize>,
@@ -66,8 +152,10 @@ pub struct AppState {
     pub queue_cap: usize,
     /// R4：KNN 并发限流信号量
     pub knn_sem: Arc<tokio::sync::Semaphore>,
-    /// R10：管理/写端点 Bearer Token（None=匿名放行，仅 127.0.0.1 + 强警告）
-    pub auth_token: Option<String>,
+    /// R10/F-SEC-2：token→role 认证配置（空 = 匿名放行，仅环回安全）
+    pub auth: Arc<AuthConfig>,
+    /// F-OPS-8：bind 是否环回。true 时 /stats 匿名放行；false 时 /stats 需 ≥readonly 认证。
+    pub bind_is_loopback: bool,
 }
 
 #[derive(Serialize)]
@@ -138,7 +226,9 @@ pub struct CompactResp {
 }
 
 /// 构建 axum Router（main + 测试共用）
-/// R10：管理/写端点（compact/kv/vector/columnar）挂 auth middleware；只读监控（health/stats/metrics/knn）放行。
+/// R10：管理/写端点（compact/kv/vector/columnar）挂 auth；只读监控（health/metrics/knn）放行。
+/// F-OPS-8：/stats 仅非环回时挂 auth（stats_endpoint 内自判 bind_is_loopback）。
+/// F-SEC-7：全局 DefaultBodyLimit 16MB，拒超大 payload 在反序列化前 DoS。
 pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health))
@@ -149,26 +239,117 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/kv", post(put_kv_endpoint))
         .route("/vector", post(insert_vector_endpoint))
         .route("/columnar", post(put_columnar_endpoint))
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
 }
 
-// R10：Bearer Token 认证校验。auth_token=Some 时管理/写端点必须带 `Authorization: Bearer <token>`。
-// None=匿名放行（仅 127.0.0.1 部署可接受，main 启动时强警告）。
-fn require_auth(state: &AppState, headers: &HeaderMap) -> Result<(), AppError> {
-    let Some(token) = &state.auth_token else {
-        return Ok(());
-    };
-    let expected = format!("Bearer {}", token);
-    match headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-    {
-        Some(v) if v == expected => Ok(()),
-        _ => Err(AppError(
+// R10/F-SEC-2：角色门禁校验。返授权角色（匿名放行时为 Admin，因仅环回无 token 场景安全）。
+// configured=true（配了 token）但未命中/角色不足 → 401/403。
+fn require_role(
+    state: &AppState,
+    headers: &HeaderMap,
+    min: AuthRole,
+) -> Result<AuthRole, AppError> {
+    let (role, configured) = state.auth.check(headers);
+    if !configured {
+        // 未配 token = 匿名放行（main 已对非环回+无 token 强警告）。匿名视作 Admin。
+        return Ok(AuthRole::Admin);
+    }
+    match role {
+        Some(r) if r >= min => Ok(r),
+        Some(r) => Err(AppError(
+            StatusCode::FORBIDDEN,
+            format!(
+                "role {} insufficient, require >= {}",
+                r.label(),
+                min.label()
+            ),
+        )),
+        None => Err(AppError(
             StatusCode::UNAUTHORIZED,
             "missing or invalid Authorization Bearer token".to_string(),
         )),
     }
+}
+
+/// F-SEC-2：compact 审计日志 —— 记谁（授权角色）触发了 compact + 起止 + 结果。
+/// token 本身不入日志（敏感），仅记角色 + 时间戳 + 段计数。
+fn audit_compact(role: AuthRole, live_vectors: usize, reclaimable: usize, elapsed_us: u64) {
+    tracing::info!(
+        actor_role = role.label(),
+        live_vectors,
+        reclaimable_segs = reclaimable,
+        elapsed_us,
+        "compact triggered (audit F-SEC-2)"
+    );
+}
+
+/// F-SEC-2/F-SEC-3：从 env / 文件载入三角色 token 构 AuthConfig（main + fs-cli 共用）。
+/// env 取明文，file 取首行（去空白，避免 ps/proc 明文）。两源都缺的角色不登记。文件读失败 = Err。
+pub fn build_auth_from_env() -> Result<AuthConfig, BuildAuthError> {
+    let mut auth = AuthConfig::empty();
+    load_role_token(
+        &mut auth,
+        AuthRole::Admin,
+        "FS_AUTH_TOKEN",
+        "FS_AUTH_TOKEN_FILE",
+    )?;
+    load_role_token(
+        &mut auth,
+        AuthRole::Readwrite,
+        "FS_AUTH_TOKEN_RW",
+        "FS_AUTH_TOKEN_RW_FILE",
+    )?;
+    load_role_token(
+        &mut auth,
+        AuthRole::Readonly,
+        "FS_AUTH_TOKEN_RO",
+        "FS_AUTH_TOKEN_RO_FILE",
+    )?;
+    Ok(auth)
+}
+
+/// build_auth_from_env 错误（文件读失败或空文件）
+#[derive(Debug)]
+pub struct BuildAuthError(String);
+
+impl std::fmt::Display for BuildAuthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "build auth: {}", self.0)
+    }
+}
+
+impl std::error::Error for BuildAuthError {}
+
+fn load_role_token(
+    auth: &mut AuthConfig,
+    role: AuthRole,
+    env_key: &str,
+    file_key: &str,
+) -> Result<(), BuildAuthError> {
+    if let Ok(tok) = std::env::var(env_key) {
+        if !tok.is_empty() {
+            auth.add(tok, role);
+            tracing::info!(role = ?role, src = "env", "auth token registered");
+            return Ok(());
+        }
+    }
+    if let Ok(path) = std::env::var(file_key) {
+        if !path.is_empty() {
+            let raw = std::fs::read_to_string(&path)
+                .map_err(|e| BuildAuthError(format!("read {} ({}): {}", file_key, path, e)))?;
+            let tok = raw.trim().to_string();
+            if tok.is_empty() {
+                return Err(BuildAuthError(format!(
+                    "{} points to empty token file: {}",
+                    file_key, path
+                )));
+            }
+            auth.add(tok, role);
+            tracing::info!(role = ?role, src = "file", "auth token registered");
+        }
+    }
+    Ok(())
 }
 
 async fn health(State(s): State<Arc<AppState>>) -> Response {
@@ -199,7 +380,15 @@ async fn health(State(s): State<Arc<AppState>>) -> Response {
         .into_response()
 }
 
-async fn stats(State(s): State<Arc<AppState>>) -> Result<Json<StatsResp>, AppError> {
+async fn stats(
+    State(s): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<StatsResp>, AppError> {
+    // F-OPS-8：非环回绑定时 /stats 暴露 namespace 规模（向量数/磁盘占用），需 ≥readonly 认证。
+    // 环回部署维持匿名放行（本地调试便利）。
+    if !s.bind_is_loopback {
+        require_role(&s, &headers, AuthRole::Readonly)?;
+    }
     let kv_used = s.engine.kv().used_bytes()?;
     let kv_quota = s.engine.kv().quota_limit();
     let kv_disk = s.engine.kv().disk_bytes()?;
@@ -242,8 +431,8 @@ async fn compact_endpoint(
     State(s): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<CompactResp>, AppError> {
-    // R10：管理端点强制认证（无 token 拒 401，防远程触发 compact DoS）
-    require_auth(&s, &headers)?;
+    // R10/F-SEC-2：管理端点强制 admin 角色（无 token 拒 401，防远程触发 compact DoS）
+    let role = require_role(&s, &headers, AuthRole::Admin)?;
     // compact 期间标记 compact_in_progress 供 /health 报 unavailable（E11）
     let was = s
         .compact_in_progress
@@ -269,7 +458,8 @@ async fn compact_endpoint(
     match res {
         Ok(r) => {
             metrics::observe("compact", "ok", us);
-            tracing::info!(live = r.live_vectors, "compact endpoint done");
+            // F-SEC-2：审计日志（角色+结果+计数，不入 token 明文）
+            audit_compact(role, r.live_vectors, r.reclaimable_segs.len(), us);
             Ok(Json(CompactResp {
                 live_vectors: r.live_vectors,
                 reclaimable_segs: r.reclaimable_segs.len(),
@@ -277,6 +467,7 @@ async fn compact_endpoint(
         }
         Err(e) => {
             metrics::observe("compact", "error", us);
+            tracing::warn!(actor_role = role.label(), error = %e, "compact failed (audit F-SEC-2)");
             Err(AppError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
         }
     }
@@ -287,8 +478,8 @@ async fn put_kv_endpoint(
     headers: HeaderMap,
     Json(req): Json<PutKvReq>,
 ) -> Result<StatusCode, AppError> {
-    // R10：写端点强制认证
-    require_auth(&s, &headers)?;
+    // R10/F-SEC-2：写端点需 ≥readwrite 角色
+    require_role(&s, &headers, AuthRole::Readwrite)?;
     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
     let wreq = WriteReq::PutKv {
         key: req.key.into_bytes(),
@@ -305,7 +496,7 @@ async fn insert_vector_endpoint(
     headers: HeaderMap,
     Json(req): Json<InsertVectorReq>,
 ) -> Result<StatusCode, AppError> {
-    require_auth(&s, &headers)?;
+    require_role(&s, &headers, AuthRole::Readwrite)?;
     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
     let wreq = WriteReq::InsertVector {
         id: req.id,
@@ -322,7 +513,7 @@ async fn put_columnar_endpoint(
     headers: HeaderMap,
     Json(req): Json<PutColumnarReq>,
 ) -> Result<StatusCode, AppError> {
-    require_auth(&s, &headers)?;
+    require_role(&s, &headers, AuthRole::Readwrite)?;
     let ipc = base64_decode(&req.ipc_base64)?;
     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
     let wreq = WriteReq::PutColumnar {
@@ -462,7 +653,17 @@ pub fn spawn_write_worker_pool(
             let req = {
                 let mut guard = match rx.lock() {
                     Ok(g) => g,
-                    Err(e) => e.into_inner(),
+                    Err(e) => {
+                        // F-ERR-1：毒锁恢复 —— worker 持锁时 panic 致 Mutex 中毒。
+                        // into_inner 取出底层 Receiver 强制续命（避免写队列全停），但状态可能不一致，
+                        // 显式告警 + 计 metric 供运维感知线程 panic 事件。
+                        tracing::error!(
+                            wid,
+                            "write worker rx lock poisoned — recovered via into_inner (a worker panicked)"
+                        );
+                        metrics::inc("poison_lock_recover", "rx");
+                        e.into_inner()
+                    }
                 };
                 match guard.try_recv() {
                     Ok(r) => r,

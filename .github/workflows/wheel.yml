@@ -1,6 +1,7 @@
 # fusion-store Python wheel 构建 [v2 PRD-plan §771 #4]
 # fs-ffi-py（PyO3）arm64 wheel —— maturin build。push tag v* 触发，手工 workflow_dispatch 可跑。
 # 落地 PRD §771 #4：M3 先 maturin develop 本地用，CI 发布 arm64 wheel 纳入 M4。
+# F-OPS-2：发布前 maturin develop + pytest test_binding.py 验证绑定可用，再 build wheel。
 name: wheel
 
 on:
@@ -14,11 +15,19 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
+      - name: rustup toolchain
+        run: rustup toolchain install 1.94 --profile minimal && rustup default 1.94
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install maturin
-        run: pip install 'maturin>=1.4,<2.0'
+      - name: Install maturin + numpy + pytest
+        run: pip install 'maturin>=1.4,<2.0' numpy pytest
+      - name: maturin develop (verify binding before build)
+        working-directory: crates/fs-ffi-py
+        run: maturin develop
+      - name: pytest test_binding.py (F-OPS-2)
+        working-directory: crates/fs-ffi-py
+        run: python -m pytest tests/test_binding.py -v
       - name: Build wheel (fs-ffi-py, arm64)
         working-directory: crates/fs-ffi-py
         run: maturin build --release --interpreter python3

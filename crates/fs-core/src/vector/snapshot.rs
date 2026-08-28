@@ -125,8 +125,16 @@ pub fn persist(dir: &Path, bytes: &[u8]) -> Result<()> {
     file.sync_all()?;
     // 原子切换：rename(tmp -> live)，再 fsync 目录使 rename 落盘
     std::fs::rename(&tmp_path, &path)?;
+    // F-ERR-3：dir fsync 使 rename 元数据落盘。失败不致命（文件已 rename 成功，下次 checkpoint
+    // 再 fsync），但崩溃窗口内 rename 可能未落盘 → 回滚到旧 snapshot；显式 error 告警供运维察觉。
     if let Ok(dirf) = File::open(dir) {
-        let _ = dirf.sync_all();
+        if let Err(e) = dirf.sync_all() {
+            tracing::error!(
+                dir = %dir.display(),
+                err = %e,
+                "graph snapshot dir fsync failed — rename may not be durable until next checkpoint"
+            );
+        }
     }
     tracing::info!(path = %path.display(), bytes = bytes.len(), "graph snapshot persisted (atomic tmp+rename)");
     Ok(())

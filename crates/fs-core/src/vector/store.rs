@@ -61,6 +61,10 @@ const RECLAIM_SAFETY: std::time::Duration = MIN_RECLAIM_SAFETY;
 const VEC_LOCATOR_DB: &str = "vec_locators";
 /// schema 元信息 key
 const SCHEMA_KEY: &[u8] = b"schema";
+/// F-CODE-1：向量 heed env map_size 上限（vec_meta：locator + schema）。
+/// locator 16B/项，256MB ≈ 1600 万向量（远超单机向量 namespace 典型规模）；
+/// 写满抛 MapFull（非 panic），caller 据此告警或重建更大 map_size。
+const VEC_META_MAP_SIZE: usize = 256 * 1024 * 1024;
 
 /// 读侧句柄缓存 —— 封存段映射 + active 段只读映射 + LRU + 封存时刻。
 /// R1：独立出来放 RwLock 内部可变，使读路径（vec_slice/read_vec）仅持 RwLock 读锁即可
@@ -364,8 +368,12 @@ impl VecSegmentPool {
 
     /// 全部段 id（封存 + active）—— compact 记旧段用
     fn all_seg_ids(&self) -> Vec<u32> {
-        // poison 极罕见；回退仅含 active，宁可漏回收费空间不失正确性
-        let hc = self.handles.read().unwrap_or_else(|e| e.into_inner());
+        // poison 极罕见；回退仅含 active，宁可漏回收费空间不失正确性。
+        // F-ERR-1：into_inner 恢复毒锁，显式告警供运维感知线程 panic（状态可能不一致）。
+        let hc = self.handles.read().unwrap_or_else(|e| {
+            tracing::error!("handles lock poisoned in all_seg_ids — recovered via into_inner (compact may miss some sealed segs)");
+            e.into_inner()
+        });
         let mut ids: Vec<u32> = hc.sealed.keys().copied().collect();
         ids.push(self.active_id);
         ids
@@ -398,7 +406,14 @@ impl VecSegmentPool {
 
     /// A5：从缓存移除已回收段（删文件后清映射 + LRU + 时间戳）
     fn drop_sealed(&mut self, seg_id: u32) {
-        let mut hc = self.handles.write().unwrap_or_else(|e| e.into_inner());
+        // F-ERR-1：into_inner 恢复毒锁，显式告警（写锁中毒 = 有线程在改 handles 时 panic）。
+        let mut hc = self.handles.write().unwrap_or_else(|e| {
+            tracing::error!(
+                seg_id,
+                "handles write lock poisoned in drop_sealed — recovered via into_inner"
+            );
+            e.into_inner()
+        });
         hc.drop_sealed(seg_id);
     }
 }
@@ -468,13 +483,16 @@ fn ensure_disk_available(dir: &Path, needed: u64) -> Result<()> {
         // statvfs 取目录所在卷可用空间
         let cdir = CString::new(dir.as_os_str().as_bytes())
             .map_err(|e| crate::StoreError::Corrupt(format!("path cstring: {}", e)))?;
+        // F-SEC-6：statvfs 是 POD（全数值字段，无指针/union/Drop），std::mem::zeroed() 安全——
+        // libc::statvfs(cdir, &mut statv) 整体覆写全部字段，zeroed 仅占位未初始化内存。
+        // 零初始化的 statvfs 无非法指针/null 引用可解引用（f_fsid 是数组非指针），故无 UB。
         let mut statv: libc::statvfs = unsafe { std::mem::zeroed() };
         let rc = unsafe { libc::statvfs(cdir.as_ptr(), &mut statv) };
         if rc != 0 {
             tracing::warn!("disk precheck statvfs failed, skip guard");
             return Ok(());
         }
-        let avail = statv.f_bavail as u64 * statv.f_frsize as u64;
+        let avail = statv.f_bavail as u64 * statv.f_frsize;
         if avail < needed {
             tracing::error!(
                 needed,
@@ -521,8 +539,8 @@ impl VectorIndex {
         std::fs::create_dir_all(&meta_dir)?;
         let env = unsafe {
             EnvOpenOptions::new()
-                .map_size(256 * 1024 * 1024)
-                .max_dbs(8)
+                .map_size(VEC_META_MAP_SIZE)
+                .max_dbs(crate::HEED_MAX_DBS)
                 // NO_SYNC：locator 元数据 commit 不 fsync；WAL 唯一同步点（H5）
                 .flags(heed::EnvFlags::NO_SYNC)
                 .open(&meta_dir)?
@@ -571,8 +589,8 @@ impl VectorIndex {
         let meta_dir = ns_dir.join("vec_meta");
         let env = unsafe {
             EnvOpenOptions::new()
-                .map_size(256 * 1024 * 1024)
-                .max_dbs(8)
+                .map_size(VEC_META_MAP_SIZE)
+                .max_dbs(crate::HEED_MAX_DBS)
                 // NO_SYNC：locator 元数据 commit 不 fsync；WAL 唯一同步点（H5）
                 .flags(heed::EnvFlags::NO_SYNC)
                 .open(&meta_dir)?
@@ -838,7 +856,7 @@ impl VectorIndex {
             .read()
             .map_err(|_| crate::StoreError::LockPoisoned)?;
         let dist = self.make_query_dist(query);
-        let found = graph.search_knn(&dist, top_k, deadline)?;
+        let found = graph.search_knn(&dist, top_k, self.schema.ef_search, deadline)?;
         // R6：遍历中有坏读 → 显式报错，不返回静默丢节点的结果
         if self.read_error.load(Ordering::Acquire) {
             tracing::error!("knn completed but vector read errors occurred — result unreliable");

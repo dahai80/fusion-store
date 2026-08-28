@@ -97,6 +97,10 @@ enum Cmd {
         /// 监听端口（默认 11463 R3）
         #[arg(long, env = "FUSION_STORE_PORT", default_value_t = fs_serve::DEFAULT_PORT)]
         port: u16,
+        /// 监听地址（F-SEC-1，默认 127.0.0.1 环回；FS_BIND 环境变量可覆盖）。
+        /// 容器化/网络部署设 0.0.0.0，务必同时配 FS_AUTH_TOKEN + 网络层 ACL。
+        #[arg(long, env = "FS_BIND", default_value = "127.0.0.1")]
+        bind: String,
         /// 向量维度（建库用，已存在则忽略）
         #[arg(long, default_value_t = 768)]
         dim: usize,
@@ -151,11 +155,17 @@ async fn main() -> Result<()> {
         Cmd::Serve {
             namespace,
             port,
+            bind,
             dim,
             queue_cap,
             seg_size,
             quota,
-        } => cmd_serve(&home, &namespace, port, dim, queue_cap, seg_size, quota).await?,
+        } => {
+            cmd_serve(
+                &home, &namespace, port, bind, dim, queue_cap, seg_size, quota,
+            )
+            .await?
+        }
     }
     Ok(())
 }
@@ -301,10 +311,13 @@ fn cmd_recover(home: &Path, ns: &str, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
+// F-SEC-1：参数从 clap Serve 子命令透传，数量由 CLI flag 决定，非设计冗余。
+#[allow(clippy::too_many_arguments)]
 async fn cmd_serve(
     home: &Path,
     ns: &str,
     port: u16,
+    bind: String,
     dim: usize,
     queue_cap: usize,
     _seg_size: u64,
@@ -337,16 +350,24 @@ async fn cmd_serve(
         rx,
         fs_serve::WRITE_WORKERS,
     );
-    // R10：CLI serve 不绑 auth token（本地工具，匿名放行 + 强警告）
-    let auth_token = match std::env::var("FS_AUTH_TOKEN") {
-        Ok(t) if !t.is_empty() => Some(t),
-        _ => {
-            tracing::warn!(
-                "FS_AUTH_TOKEN not set: admin/write endpoints anonymous (loopback only)"
-            );
-            None
-        }
-    };
+    // R10/F-SEC-2/F-SEC-3：CLI serve 共享 fs-serve 的 token→role 载入逻辑（env + 文件）。
+    // CLI 本地工具常匿名放行；若 FS_AUTH_TOKEN* 已设则按角色门禁（与 daemon 一致）。
+    let auth = fs_serve::build_auth_from_env().with_context(|| "load auth tokens from env/file")?;
+    let auth_enabled = !auth.is_empty();
+    if !auth_enabled {
+        tracing::warn!("FS_AUTH_TOKEN not set: admin/write endpoints anonymous (loopback only)");
+    }
+    // F-SEC-1：监听地址经 --bind/FS_BIND 配置。先解析定 bind_is_loopback（F-OPS-8 /stats 守门用）。
+    let ip: std::net::IpAddr = bind
+        .parse()
+        .with_context(|| format!("invalid --bind/FS_BIND address: {}", bind))?;
+    if !ip.is_loopback() && !auth_enabled {
+        tracing::warn!(
+            bind = %bind,
+            "NON-LOOPBACK bind WITHOUT FS_AUTH_TOKEN — admin/write endpoints exposed unauthenticated. \
+             Set FS_AUTH_TOKEN or bind 127.0.0.1."
+        );
+    }
     let state = Arc::new(fs_serve::AppState {
         engine,
         queue_depth,
@@ -354,11 +375,12 @@ async fn cmd_serve(
         write_tx: tx,
         queue_cap: cap,
         knn_sem: Arc::new(tokio::sync::Semaphore::new(fs_serve::KNN_CONCURRENCY)),
-        auth_token,
+        auth: Arc::new(auth),
+        bind_is_loopback: ip.is_loopback(),
     });
     let app = fs_serve::build_router(state);
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    tracing::info!(addr = %addr, namespace = %ns, "fusion-store serve listening");
+    let addr = SocketAddr::from((ip, port));
+    tracing::info!(addr = %addr, namespace = %ns, auth = auth_enabled, "fusion-store serve listening");
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())

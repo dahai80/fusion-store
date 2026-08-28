@@ -1,5 +1,4 @@
 /target
-Cargo.lock
 .ruff_cache/
 .remember/logs/
 .remember/tmp/

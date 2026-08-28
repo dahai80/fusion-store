@@ -14,22 +14,24 @@ use std::sync::Arc;
 use fs_core::vector::schema::{MetricKind, VectorSchema};
 use fs_core::{Engine, FusionStoreEngine};
 use fs_serve::{
-    build_router, metrics, spawn_write_worker_pool, AppState, WriteReq, DEFAULT_QUEUE_CAP,
-    KNN_CONCURRENCY, WRITE_WORKERS,
+    build_router, metrics, spawn_write_worker_pool, AppState, AuthConfig, AuthRole, WriteReq,
+    DEFAULT_QUEUE_CAP, KNN_CONCURRENCY, MAX_BODY_BYTES, WRITE_WORKERS,
 };
 use tempfile::tempdir;
 use tokio::sync::mpsc;
 
-/// 起一个绑定临时端口的 daemon，返回 base URL + AppState 句柄（测后清理）
-/// auth_token: None=匿名放行；Some=管理/写端点强制 Bearer（R10）
+/// 起一个绑定临时端口的 daemon，返回 base URL + AppState 句柄（测后清理）。
+/// auth: 空 AuthConfig=匿名放行；非空=按 RBAC 角色门禁（R10/F-SEC-2）。
+/// bind_is_loopback=true（测试默认绑环回）；/stats 守门测另设。
 async fn spawn_daemon(dim: usize, queue_cap: usize) -> (String, Arc<AppState>) {
-    spawn_daemon_with_auth(dim, queue_cap, None).await
+    spawn_daemon_with_auth(dim, queue_cap, AuthConfig::empty(), true).await
 }
 
 async fn spawn_daemon_with_auth(
     dim: usize,
     queue_cap: usize,
-    auth_token: Option<String>,
+    auth: AuthConfig,
+    bind_is_loopback: bool,
 ) -> (String, Arc<AppState>) {
     // leak tempdir 进 'static：DirHandle + 路径均不回收（测试进程退出即清理）
     let dir = Box::leak(Box::new(tempdir().unwrap()));
@@ -52,7 +54,8 @@ async fn spawn_daemon_with_auth(
         write_tx: tx,
         queue_cap,
         knn_sem: Arc::new(tokio::sync::Semaphore::new(KNN_CONCURRENCY)),
-        auth_token,
+        auth: Arc::new(auth),
+        bind_is_loopback,
     });
     let app = build_router(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -253,10 +256,12 @@ async fn health_reports_backpressure_when_depth_high() {
         .store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
-// R10：管理端点设 auth_token 后，无 Bearer → 401，带正确 Bearer → 通过
+// R10/F-SEC-2：管理端点配 admin token 后，无 Bearer → 401，带正确 Bearer → 通过
 #[tokio::test]
 async fn admin_endpoint_requires_bearer_token() {
-    let (url, _state) = spawn_daemon_with_auth(4, DEFAULT_QUEUE_CAP, Some("s3cret".into())).await;
+    let mut auth = AuthConfig::empty();
+    auth.add("s3cret".into(), AuthRole::Admin);
+    let (url, _state) = spawn_daemon_with_auth(4, DEFAULT_QUEUE_CAP, auth, true).await;
     let client = reqwest::Client::new();
     // 无 token → 401
     let resp = client
@@ -287,10 +292,12 @@ async fn admin_endpoint_requires_bearer_token() {
     );
 }
 
-// R10：写端点 /kv 同样受 auth 保护（无 token → 401）
+// R10/F-SEC-2：写端点 /kv 配 admin token 后受 auth 保护（无 token → 401）
 #[tokio::test]
 async fn kv_write_requires_bearer_when_auth_set() {
-    let (url, _state) = spawn_daemon_with_auth(4, DEFAULT_QUEUE_CAP, Some("tok".into())).await;
+    let mut auth = AuthConfig::empty();
+    auth.add("tok".into(), AuthRole::Admin);
+    let (url, _state) = spawn_daemon_with_auth(4, DEFAULT_QUEUE_CAP, auth, true).await;
     let client = reqwest::Client::new();
     let resp = client
         .post(format!("{}/kv", url))
@@ -301,10 +308,12 @@ async fn kv_write_requires_bearer_when_auth_set() {
     assert_eq!(resp.status(), 401, "kv write without token → 401 (R10)");
 }
 
-// R10：只读端点 /health /stats 不受 auth 限制（无 token 仍可读）
+// R10/F-SEC-2：只读端点 /health /stats 在环回绑定时不受 auth 限制（无 token 仍可读）
 #[tokio::test]
 async fn read_endpoints_not_gated_by_auth() {
-    let (url, _state) = spawn_daemon_with_auth(4, DEFAULT_QUEUE_CAP, Some("tok".into())).await;
+    let mut auth = AuthConfig::empty();
+    auth.add("tok".into(), AuthRole::Admin);
+    let (url, _state) = spawn_daemon_with_auth(4, DEFAULT_QUEUE_CAP, auth, true).await;
     let resp = reqwest::get(format!("{}/health", url)).await.unwrap();
     assert_eq!(
         resp.status(),
@@ -347,5 +356,109 @@ async fn vector_write_endpoint_roundtrips() {
         results[0]["id"].as_u64().unwrap(),
         42,
         "vector 42 retrievable via knn (E10)"
+    );
+}
+
+// F-SEC-2：RBAC 角色门禁 —— readonly token 写 /kv 拒 403，admin token 写通过
+#[tokio::test]
+async fn rbac_readonly_rejected_on_write() {
+    let mut auth = AuthConfig::empty();
+    auth.add("ro-tok".into(), AuthRole::Readonly);
+    auth.add("adm-tok".into(), AuthRole::Admin);
+    let (url, _state) = spawn_daemon_with_auth(4, DEFAULT_QUEUE_CAP, auth, true).await;
+    let client = reqwest::Client::new();
+    // readonly 写 /kv → 403（角色不足）
+    let resp = client
+        .post(format!("{}/kv", url))
+        .header("Authorization", "Bearer ro-tok")
+        .json(&serde_json::json!({"key": "k", "value": "v"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        403,
+        "readonly token write /kv → 403 (F-SEC-2 RBAC)"
+    );
+    // admin 写 /kv → 204（admin ≥ readwrite）
+    let resp = client
+        .post(format!("{}/kv", url))
+        .header("Authorization", "Bearer adm-tok")
+        .json(&serde_json::json!({"key": "k", "value": "v"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        204,
+        "admin token write /kv → 204 (F-SEC-2 RBAC)"
+    );
+}
+
+// F-SEC-2：readonly token 触发 compact → 403（compact 需 admin）
+#[tokio::test]
+async fn rbac_readonly_rejected_on_compact() {
+    let mut auth = AuthConfig::empty();
+    auth.add("ro-tok".into(), AuthRole::Readonly);
+    let (url, _state) = spawn_daemon_with_auth(4, DEFAULT_QUEUE_CAP, auth, true).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/admin/compact", url))
+        .header("Authorization", "Bearer ro-tok")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        403,
+        "readonly token compact → 403 (F-SEC-2 RBAC)"
+    );
+}
+
+// F-OPS-8：非环回绑定时 /stats 需 ≥readonly 认证；无 token → 401，readonly token → 200
+#[tokio::test]
+async fn stats_requires_auth_when_non_loopback() {
+    let mut auth = AuthConfig::empty();
+    auth.add("ro-tok".into(), AuthRole::Readonly);
+    let (url, _state) = spawn_daemon_with_auth(4, DEFAULT_QUEUE_CAP, auth, false).await;
+    let client = reqwest::Client::new();
+    // 无 token → 401
+    let resp = client.get(format!("{}/stats", url)).send().await.unwrap();
+    assert_eq!(
+        resp.status(),
+        401,
+        "stats non-loopback without token → 401 (F-OPS-8)"
+    );
+    // readonly token → 200
+    let resp = client
+        .get(format!("{}/stats", url))
+        .header("Authorization", "Bearer ro-tok")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "stats non-loopback with readonly token → 200 (F-OPS-8)"
+    );
+}
+
+// F-SEC-7：请求体超 16MB → 413 Payload Too Large（反序列化前拦截）
+#[tokio::test]
+async fn body_limit_rejects_oversized_payload() {
+    let (url, _state) = spawn_daemon(4, DEFAULT_QUEUE_CAP).await;
+    let client = reqwest::Client::new();
+    // 构造超限 value（MAX_BODY_BYTES + 1，JSON 编码后更超，触发 DefaultBodyLimit）
+    let oversized = "x".repeat(MAX_BODY_BYTES + 1);
+    let resp = client
+        .post(format!("{}/kv", url))
+        .json(&serde_json::json!({"key": "k", "value": oversized}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        413,
+        "oversized body → 413 Payload Too Large (F-SEC-7)"
     );
 }

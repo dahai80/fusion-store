@@ -7,16 +7,16 @@ license.workspace = true
 
 [dependencies]
 fs-core = { path = "../fs-core", features = ["columnar"] }
-axum = "0.7"
-tokio = { version = "1", features = ["full"] }
-prometheus = "0.13"
-clap = { version = "4", features = ["derive", "env"] }
+axum = { workspace = true }
+tokio = { workspace = true }
+prometheus = { workspace = true }
+clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-base64 = "0.22"
+base64 = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-anyhow = "1"
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

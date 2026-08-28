@@ -31,6 +31,9 @@ const COL_TABLE_DB: &str = "col_tables";
 /// 列式配额计数 DB（A3：与 KV 对称，key=固定 "used" -> u64 字节）
 const COL_QUOTA_DB: &str = "col_quota";
 const COL_QUOTA_KEY: &[u8] = b"used";
+/// F-CODE-2：列式 heed env map_size 上限（meta：table_meta + quota）。
+/// table_meta 随表数+列数增长，2GB 留充足余量（E8）；写满抛 MapFull（非 panic）。
+const COL_META_MAP_SIZE: usize = 2 * 1024 * 1024 * 1024;
 
 /// 列式存储 —— 单 namespace
 pub struct ColumnarStore {
@@ -69,9 +72,9 @@ impl ColumnarStore {
             .open(&lock_path)?;
         let env = unsafe {
             EnvOpenOptions::new()
-                // E8：map_size 提至 2GB，免 table_meta 膨胀触 MapFull panic
-                .map_size(2 * 1024 * 1024 * 1024)
-                .max_dbs(8)
+                // F-CODE-2：map_size 提至 2GB，免 table_meta 膨胀触 MapFull panic
+                .map_size(COL_META_MAP_SIZE)
+                .max_dbs(crate::HEED_MAX_DBS)
                 // NO_SYNC：WAL 唯一 crash-safe 同步点（H5）， heed 仅存元数据
                 .flags(heed::EnvFlags::NO_SYNC)
                 .open(&meta_dir)?
@@ -190,7 +193,16 @@ impl ColumnarStore {
         if let Err(e) = append_result {
             // L3：中途 append 失败，回退到首列前游标，免半写表段内泄漏
             tracing::warn!(table_id, err = ?e, "put_columnar append failed, rewinding");
-            let _ = pool.rewind_active_to(rollback_seg, rollback_off);
+            if let Err(re) = pool.rewind_active_to(rollback_seg, rollback_off) {
+                // F-ERR-2：rewind 本身失败段内留垃圾，但不掩盖原始 append 错；显式告警供运维介入
+                tracing::error!(
+                    table_id,
+                    seg = rollback_seg,
+                    off = rollback_off,
+                    err = ?re,
+                    "put_columnar rewind failed after append error — segment may leak bytes"
+                );
+            }
             return Err(e);
         }
         // A3：配额净增校验（覆盖语义下减旧表字节）
@@ -204,7 +216,15 @@ impl ColumnarStore {
                 limit = self.quota_limit,
                 "columnar quota exceeded, reject put_columnar"
             );
-            let _ = pool.rewind_active_to(rollback_seg, rollback_off);
+            if let Err(re) = pool.rewind_active_to(rollback_seg, rollback_off) {
+                tracing::warn!(
+                    table_id,
+                    seg = rollback_seg,
+                    off = rollback_off,
+                    err = ?re,
+                    "put_columnar rewind failed after quota reject — segment may leak bytes"
+                );
+            }
             wtxn.abort();
             return Err(StoreError::QuotaExceeded);
         }
@@ -219,7 +239,15 @@ impl ColumnarStore {
         // L3：commit 失败也回滚段字节
         if let Err(e) = wtxn.commit() {
             tracing::warn!(table_id, err = ?e, "put_columnar commit failed, rewinding");
-            let _ = pool.rewind_active_to(rollback_seg, rollback_off);
+            if let Err(re) = pool.rewind_active_to(rollback_seg, rollback_off) {
+                tracing::error!(
+                    table_id,
+                    seg = rollback_seg,
+                    off = rollback_off,
+                    err = ?re,
+                    "put_columnar rewind failed after commit error — segment may leak bytes"
+                );
+            }
             return Err(e.into());
         }
         tracing::info!(
@@ -341,29 +369,37 @@ fn write_col_quota_txn(db: &Database<Bytes, Bytes>, wtxn: &mut RwTxn, val: u64) 
     Ok(())
 }
 
-/// 取 primitive 列的 raw data buffer 字节（落段前）
+/// 取 primitive 列的 raw data buffer 字节（落段前）。
+/// F-COL-2：downcast 失败回 StoreError::Corrupt（非 panic）——dtype 由 ColType::from_arrow
+/// 上游校验，理论不失败；但 arrow 动态类型不保证，downcast 错配以显式错误暴露，不吞没。
 fn primitive_buffer_bytes(dt: &DataType, arr: &dyn arrow::array::Array) -> Result<Vec<u8>> {
     match dt {
         DataType::Int32 => {
-            let a = arr.as_any().downcast_ref::<Int32Array>().expect("Int32");
+            let a = arr
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .ok_or_else(|| StoreError::Corrupt("Int32 downcast failed".into()))?;
             Ok(bytemuck_cast(a.values().as_ref()))
         }
         DataType::Int64 => {
-            let a = arr.as_any().downcast_ref::<Int64Array>().expect("Int64");
+            let a = arr
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| StoreError::Corrupt("Int64 downcast failed".into()))?;
             Ok(bytemuck_cast(a.values().as_ref()))
         }
         DataType::Float32 => {
             let a = arr
                 .as_any()
                 .downcast_ref::<Float32Array>()
-                .expect("Float32");
+                .ok_or_else(|| StoreError::Corrupt("Float32 downcast failed".into()))?;
             Ok(bytemuck_cast(a.values().as_ref()))
         }
         DataType::Float64 => {
             let a = arr
                 .as_any()
                 .downcast_ref::<Float64Array>()
-                .expect("Float64");
+                .ok_or_else(|| StoreError::Corrupt("Float64 downcast failed".into()))?;
             Ok(bytemuck_cast(a.values().as_ref()))
         }
         DataType::Boolean => {
@@ -373,7 +409,7 @@ fn primitive_buffer_bytes(dt: &DataType, arr: &dyn arrow::array::Array) -> Resul
             let a = arr
                 .as_any()
                 .downcast_ref::<BooleanArray>()
-                .expect("Boolean");
+                .ok_or_else(|| StoreError::Corrupt("Boolean downcast failed".into()))?;
             let mut builder = BooleanBuilder::with_capacity(a.len());
             let bools: Vec<bool> = (0..a.len()).map(|i| a.value(i)).collect();
             builder.append_slice(&bools);

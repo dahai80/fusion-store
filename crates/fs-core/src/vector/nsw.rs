@@ -18,10 +18,11 @@ use std::collections::{BinaryHeap, HashMap};
 /// NSW 固定参数（PRD M2 风险对策：先固定后调参）
 pub const M: usize = 16;
 pub const EF_CONSTRUCTION: usize = 200;
-// ef_search 提至 200：单层 NSW 无多层捷径，ef=50 召回卡 0.925 不达 PRD §2.5 ≥0.95。
+// ef_search 默认 200：单层 NSW 无多层捷径，ef=50 召回卡 0.925 不达 PRD §2.5 ≥0.95。
 // PRD「ef_search=50 固定」与 §2.5 召回 SLA 冲突（Rule 7），取召回 SLA 为硬验收，
 // 调参阶段先提 ef_search 保召回；p99 预算 5ms 充足（50K 实测 ef=200 仍 <1ms）。
-pub const EF_SEARCH: usize = 200;
+// F-ARCH-2：ef_search 不再硬编码，建库时经 VectorSchema.ef_search 锁定（serde default 回落此值）。
+pub const DEFAULT_EF_SEARCH: usize = 200;
 
 /// 节点 id
 pub type NodeId = u64;
@@ -55,7 +56,7 @@ impl NswGraph {
         tracing::info!(
             M,
             EF_CONSTRUCTION,
-            EF_SEARCH,
+            DEFAULT_EF_SEARCH,
             "nsw graph created (single-layer NSW)"
         );
         Self {
@@ -221,17 +222,19 @@ impl NswGraph {
 
     /// KNN 检索 —— 带 timeout（超时返回已遍历最佳子集，A1）。
     /// query_dist: 查询向量到任意节点 id 的距离闭包（caller 零拷贝读向量算）。
+    /// ef_search: 候选集宽度（F-ARCH-2 经 VectorSchema 锁定，建库时可配），与 top_k 取大者。
     pub fn search_knn(
         &self,
         query_dist: &dyn Fn(NodeId) -> f32,
         top_k: usize,
+        ef_search: usize,
         deadline: Option<std::time::Instant>,
     ) -> crate::Result<Vec<(NodeId, f32)>> {
         let entry = match self.entry_point {
             Some(e) => e,
             None => return Ok(vec![]),
         };
-        let ef = EF_SEARCH.max(top_k);
+        let ef = ef_search.max(top_k);
         let mut found = self.search_layer(query_dist, ef, entry, deadline);
         // R5：遍历中已按 deadline 提前终止（每 256 跳查一次）；此处收尾再查一次兜底
         if let Some(dl) = deadline {
@@ -406,7 +409,7 @@ mod tests {
         // 查询接近 id=3
         let q = vec![3.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         let df = dist_fn(&v, &q, MetricKind::L2);
-        let res = g.search_knn(&df, 3, None).unwrap();
+        let res = g.search_knn(&df, 3, DEFAULT_EF_SEARCH, None).unwrap();
         assert!(!res.is_empty());
         // 最近应是 id=3
         assert_eq!(res[0].0, 3);
@@ -429,7 +432,7 @@ mod tests {
         assert!(g.delete(3));
         let q = vec![3.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         let df = dist_fn(&v, &q, MetricKind::L2);
-        let res = g.search_knn(&df, 3, None).unwrap();
+        let res = g.search_knn(&df, 3, DEFAULT_EF_SEARCH, None).unwrap();
         // 结果不含 3
         assert!(!res.iter().any(|(id, _)| *id == 3));
     }

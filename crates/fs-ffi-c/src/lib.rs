@@ -45,6 +45,7 @@ const ERR_SERDE: c_int = -13;
 const ERR_VALUE_TOO_LARGE: c_int = -14;
 const ERR_LOCK_POISONED: c_int = -15;
 const ERR_MAP_FULL: c_int = -16;
+const ERR_INVALID_KEY: c_int = -17;
 const ERR_OTHER: c_int = -99;
 
 fn err_code(e: &StoreError) -> c_int {
@@ -65,6 +66,7 @@ fn err_code(e: &StoreError) -> c_int {
         StoreError::ValueTooLarge(_) => ERR_VALUE_TOO_LARGE,
         StoreError::LockPoisoned => ERR_LOCK_POISONED,
         StoreError::MapFull { .. } => ERR_MAP_FULL,
+        StoreError::InvalidKey(_) => ERR_INVALID_KEY,
     }
 }
 

@@ -6,7 +6,7 @@
 
 - **KV state** — `mmap` + heed，crash-safe 读
 - **向量索引** — 单层 NSW 图常驻 RAM + 单 mmap 段 snapshot（非 HNSW，见下）
-- **列式数据** — Apache Arrow 通用列式
+- **列式数据** — Apache Arrow 定长原语列式（M3 范围：Int32/Int64/Float32/Float64，非全类型；见下）
 
 > **零拷贝适用范围（A7）**：零拷贝仅在 **Rust 进程内**有效（mmap + `Arc<MmapHandle>` 保活映射）。
 > C/Swift/Python 经 C-ABI 读路径**强制拷贝**到 caller-owned buffer（见 [C-ABI 节](#c-abifs-ffi-c)），
@@ -15,6 +15,10 @@
 > **向量索引命名（A2）**：本引擎向量索引是**单层 NSW**（邻接图，无多层跳表），非 HNSW。
 > 检索复杂度近似 O(N^log M)，非多层 HNSW 的 O(log N)。N 持续增长会线性劣化检索延迟，
 > p99<5ms SLA 有扩展上限（见全规模基准节）。代码类型 `NswGraph`，不再以 HNSW 对外宣传。
+>
+> **容量边界（F-ARCH-3）**：单层 NSW 无分层/分片捷径，生产建议单 namespace 向量数 **≤1-2M**。
+> 1M×768 实测 p99 1544us（5ms SLA 余量收窄）、写入 48 vecs/s（构建超线性）。超此规模需架构演进
+> （分片多 namespace / 分层 NSW），`/stats` 暴露 `vector_count` 水位供监控触发扩容决策。
 
 ## 设计
 
@@ -28,6 +32,14 @@
 - **单 namespace 隔离（A4）**：一个 `Engine` 实例 = 一个 namespace（独立目录 + WAL + heed env +
   flock）。不支持单引擎内多 namespace 路由或多租户隔离；多 namespace 是消费方职责，
   各开独立 `Engine::open`。
+
+### 运维约束（F-PERF-5 / F-SEC-4 / F-ERR-5）
+
+| 项 | 约束 |
+|----|------|
+| **compact 磁盘峰值（F-PERF-5）** | COW 写新段期间旧段延迟回收（60s `reclaim_safe`），磁盘峰值约 **2× 活数据**。大库 compact 需预留翻倍磁盘余量；运维应监控磁盘水位自动触发 compact 而非手动。`/stats` 的 `kv_disk_bytes`/`vec_disk_bytes` 暴露真实段占用（含 padding/段尾空洞，>配额净 payload）。 |
+| **flock 为 advisory（F-SEC-4）** | 多进程写互斥用 `fs2` flock（advisory，非内核强制锁），依赖所有写者遵守协议。单 namespace 单 Engine 设计下风险低，但外部进程若绕过 Engine 直写 mmap 段文件，锁不阻止。消费方**不应**绕过 API 直写段文件。 |
+| **timeout 语义（F-ERR-5）** | trait 写/读路径带 `timeout: Option<Duration>`，但实现分层：**put_kv/delete_kv** 实现阻塞 flock 超时（写锁竞争快速失败 `LockBusy`）；**insert_vector/search_knn/get_kv_zero_copy** 走段池/图锁，超时未完整实现（传 None 即无限等）；**get_vector/list_vector_ids/delete_vector** 忽略 timeout（图锁内存态，无 I/O 阻塞）。调用方按此语义传 timeout，勿假设全路径生效。 |
 
 ## 构建
 
@@ -73,7 +85,7 @@ pub trait FusionStoreEngine {
 
 ## 状态
 
-Greenfield → M0 完成（workspace 骨架 + fs-core trait）。M1 完成（KV + mmap 段）。M2 完成（NSW 图常驻 RAM + snapshot + NEON SIMD 位等 + batch）。M3 完成（Arrow 通用列式 + C-ABI + 读强制拷贝 + Python 绑定 fs-ffi-py）。M4 完成（WAL 幂等 + recover + compact COW + fs-serve + 背压 + prometheus + SLA）。审计 30 缺陷全修复（A1-A7 / R1-R10 / E1-E13，见审计纠偏节）。PRD v2.0 roadmap 全里程碑 + 全延后项落地，118 测试全绿（debug + release 双绿；fs-ffi-py 7 Python 测试另计，maturin 开发环境）。向量读取/枚举 API（`get_vector`/`list_vector_ids`）+ 删除 API 经 Engine trait → C-ABI → Python 三层全暴露（#2/#3）。
+Greenfield → M0 完成（workspace 骨架 + fs-core trait）。M1 完成（KV + mmap 段）。M2 完成（NSW 图常驻 RAM + snapshot + NEON SIMD 位等 + batch）。M3 完成（Arrow 定长原语列式 + C-ABI + 读强制拷贝 + Python 绑定 fs-ffi-py）。M4 完成（WAL 幂等 + recover + compact COW + fs-serve + 背压 + prometheus + SLA）。审计 30 缺陷全修复（A1-A7 / R1-R10 / E1-E13）+ 生产就绪审计 P0-P3 全修复（见审计纠偏节）。PRD v2.0 roadmap 全里程碑 + 全延后项落地，131 测试全绿（debug + release 双绿，含 9 例 proptest fuzz harness F-TEST-2；fs-ffi-py 7 Python 测试另计，maturin 开发环境）。向量读取/枚举 API（`get_vector`/`list_vector_ids`）+ 删除 API 经 Engine trait → C-ABI → Python 三层全暴露（#2/#3）。RBAC + audit log + token file + body limit + /stats 认证门禁（F-SEC-2/F-SEC-7/F-OPS-8）。
 
 ### 审计纠偏（A2/A4/A7/E6）
 
@@ -101,7 +113,7 @@ Greenfield → M0 完成（workspace 骨架 + fs-core trait）。M1 完成（KV 
 | C-ABI `fs_store_search_knn` 端到端通（C 程序经头+静态库链接运行） | ✅ |
 | C-ABI `fs_store_put_kv`/`get_kv` 往返（读强制拷贝 E3） | ✅ |
 | create→checkpoint→close→open 重开持久化（schema + 图 snapshot） | ✅ |
-| fs_store.h 头文件（手写对齐 9 符号，随接口增长可改 cbindgen） | ✅ |
+| fs_store.h 头文件（手写对齐 12 符号，随接口增长可改 cbindgen） | ✅ |
 | 52 测试全绿（47 core + 5 ffi；fmt + clippy -D warnings + test） | ✅ |
 | Python 绑定 fs-ffi-py（PyO3，读强制拷贝 E3，出参 owned 非 mmap view） | ✅ 7 测试全绿（另见 fs-ffi-py 节） |
 
@@ -170,6 +182,10 @@ Greenfield → M0 完成（workspace 骨架 + fs-core trait）。M1 完成（KV 
 ## C-ABI（fs-ffi-c）
 
 `crates/fs-ffi-c/` 导出 `staticlib` + `cdylib`，头文件 `crates/fs-ffi-c/fs_store.h`。Rust 消费方直接用 `fs-core` 享完整零拷贝；C/Swift 消费方经此 C-ABI（读路径强制拷贝，E3）。
+
+> **列式不暴露（F-API-2）**：C-ABI 当前仅暴露 KV + 向量原语（12 符号），**不暴露** `put_columnar`/`get_columnar`。列式 Arrow 类型（RecordBatch/IPC）跨 C-ABI 需 IPC bytes 编解码，复杂度高，PRD M3 C-ABI 验收按设计不含列式。C/Swift 消费方需列式请经 fs-serve HTTP `/columnar`（Arrow IPC base64）或 Python 绑定。属设计取舍非缺陷。
+>
+> **close 返 void（F-SEC-5）**：`fs_store_close` 签名 `void` 无法回传错误码。close 内部 engine 落盘（flush + heed sync + checkpoint）若失败，仅记 `tracing::error` 日志，**caller 无错误码感知**。C 侧正常退出后应检查日志确认无 `fs_store_close: engine close FAILED`；关键数据建议显式调 `fs_store_checkpoint` 后再 close，checkpoint 返错误码可感知。
 
 ```bash
 cargo build -p fs-ffi-c                  # 产出 target/debug/libfusion_store.a + .dylib
@@ -269,6 +285,8 @@ fs-cli --home <dir> serve   --namespace <ns> [--port 11463] [--dim 768] [--queue
 | `/admin/compact` | POST | 触发 compact COW 原子切换（A3，需 Bearer Token，R10） |
 
 写端点（`/kv`/`/vector`/`/columnar`/`/admin/compact`）强制 Bearer Token 认证（`FS_AUTH_TOKEN`，R10），无 token 拒 401；只读监控端点放行。默认监听 127.0.0.1（`--bind` 覆盖，非环回部署强警告）。
+
+Grafana dashboard 模板：[`ops/grafana-dashboard.json`](ops/grafana-dashboard.json)（F-OPS-7）—— 导入 Prometheus 数据源，含 ops 吞吐 / p99 延迟 / 段用量 vs 容量 / 背压队列深度（8000 黄 / 10000 红阈值）面板。
 
 默认模式：fusion-store 以嵌入式库被消费方 in-process 调用（零开销）；fs-serve daemon 为可选管理/监控面。
 

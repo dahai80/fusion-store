@@ -55,6 +55,10 @@ pub enum StoreError {
     #[error("lock poisoned: writer panicked while holding lock")]
     LockPoisoned,
 
+    // F-TEST-2：空 key / 超 LMDB MDB_MAXKEYSIZE key 显式拒，免晦涩 BadValSize（Rule 12 fail visibly）
+    #[error("invalid key: {0}")]
+    InvalidKey(&'static str),
+
     #[cfg(feature = "columnar")]
     #[error("arrow error: {0}")]
     Arrow(#[from] arrow::error::ArrowError),

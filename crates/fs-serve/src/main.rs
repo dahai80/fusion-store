@@ -27,6 +27,10 @@ struct Args {
     /// 监听端口（默认 11463，R3；FUSION_STORE_PORT 环境变量可覆盖）
     #[arg(long, env = "FUSION_STORE_PORT", default_value_t = DEFAULT_PORT)]
     port: u16,
+    /// 监听地址（F-SEC-1，默认 127.0.0.1 环回；FS_BIND 环境变量可覆盖）。
+    /// 容器化/网络部署设 0.0.0.0，务必同时配 FS_AUTH_TOKEN + 网络层 ACL。
+    #[arg(long, env = "FS_BIND", default_value = "127.0.0.1")]
+    bind: String,
     /// 数据根目录（默认 ~/.fusion-store）
     #[arg(long, env = "FS_HOME")]
     home: Option<PathBuf>,
@@ -85,19 +89,33 @@ async fn main() -> Result<()> {
     // R4：KNN 并发上限信号量
     let knn_sem = Arc::new(tokio::sync::Semaphore::new(KNN_CONCURRENCY));
 
-    // R10：管理/写端点 Bearer Token 认证。FS_AUTH_TOKEN 未设 = 匿名放行（强警告）。
-    let auth_token = match std::env::var("FS_AUTH_TOKEN") {
-        Ok(t) if !t.is_empty() => Some(t),
-        _ => {
-            tracing::warn!(
-                "FS_AUTH_TOKEN not set: admin/write endpoints run WITHOUT auth (anonymous). \
-                 Only safe on 127.0.0.1 loopback; do NOT expose to network without a token."
-            );
-            None
-        }
-    };
+    // F-SEC-1：监听地址经 --bind/FS_BIND 配置。先解析定 bind_is_loopback（F-OPS-8 /stats 守门用）。
+    let ip: std::net::IpAddr = args
+        .bind
+        .parse()
+        .with_context(|| format!("invalid --bind/FS_BIND address: {}", args.bind))?;
+    let bind_is_loopback = ip.is_loopback();
 
-    let auth_enabled = auth_token.is_some();
+    // R10/F-SEC-2/F-SEC-3：认证配置 —— token→role 映射。
+    // 来源优先级：FS_AUTH_TOKEN_FILE（文件，避免 ps/proc 明文泄露）> FS_AUTH_TOKEN（env，向后兼容）。
+    // 三角色 token：FS_AUTH_TOKEN/FILE=admin，FS_AUTH_TOKEN_RW=readwrite，FS_AUTH_TOKEN_RO=readonly。
+    // 全空 = 匿名放行（仅环回安全）。共享逻辑在 fs_serve::build_auth_from_env。
+    let auth = fs_serve::build_auth_from_env().context("load auth tokens from env/file")?;
+    let auth_enabled = !auth.is_empty();
+    if !auth_enabled {
+        tracing::warn!(
+            "FS_AUTH_TOKEN(_FILE) not set: admin/write endpoints run WITHOUT auth (anonymous). \
+             Only safe on 127.0.0.1 loopback; do NOT expose to network without a token."
+        );
+    }
+    if !bind_is_loopback && !auth_enabled {
+        tracing::warn!(
+            bind = %args.bind,
+            "NON-LOOPBACK bind WITHOUT FS_AUTH_TOKEN — admin/write endpoints exposed unauthenticated. \
+             Set FS_AUTH_TOKEN or bind 127.0.0.1."
+        );
+    }
+
     let state = Arc::new(AppState {
         engine,
         queue_depth,
@@ -105,11 +123,12 @@ async fn main() -> Result<()> {
         write_tx: tx,
         queue_cap,
         knn_sem,
-        auth_token,
+        auth: Arc::new(auth),
+        bind_is_loopback,
     });
     let app = build_router(state);
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], args.port));
+    let addr = SocketAddr::from((ip, args.port));
     tracing::info!(addr = %addr, namespace = %args.namespace, auth = auth_enabled, "fs-serve listening");
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;

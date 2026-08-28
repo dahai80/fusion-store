@@ -36,6 +36,10 @@ typedef struct FsStoreHandle FsStoreHandle;
 #define FS_ERR_SEGMENT_FULL -11
 #define FS_ERR_ARROW -12
 #define FS_ERR_SERDE -13
+#define FS_ERR_VALUE_TOO_LARGE -14
+#define FS_ERR_LOCK_POISONED -15
+#define FS_ERR_MAP_FULL -16
+#define FS_ERR_INVALID_KEY -17
 #define FS_ERR_OTHER -99
 
 // 新建 store：建向量索引（锁定 schema dim）+ KV store。out 接收堆分配句柄。
@@ -45,6 +49,8 @@ int fs_store_create(const char* path, size_t dim, FsStoreHandle** out);
 int fs_store_open(const char* path, FsStoreHandle** out);
 
 // 关闭句柄，释放堆内存（NULL 安全）。
+// F-SEC-5：签名 void 无法回传错误码。close 内部落盘（flush + heed sync + checkpoint）
+// 若失败仅记日志，caller 无错误码感知。关键数据建议先调 fs_store_checkpoint（返错误码）再 close。
 void fs_store_close(FsStoreHandle* h);
 
 // 写 KV。

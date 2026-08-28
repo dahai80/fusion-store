@@ -72,7 +72,7 @@ impl KvStore {
         let env = unsafe {
             EnvOpenOptions::new()
                 .map_size(KV_MAP_SIZE)
-                .max_dbs(8)
+                .max_dbs(crate::HEED_MAX_DBS)
                 // NO_SYNC：heed 仅存 locator 元数据（tiny），commit 不 fsync；
                 // WAL 是唯一 crash-safe 同步点（H5），crash 后 WAL 重放补 heed 未刷条目
                 .flags(heed::EnvFlags::NO_SYNC)
@@ -143,6 +143,17 @@ impl KvStore {
     }
 
     fn put_kv_inner(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        // F-TEST-2：空 key / 超 MDB_MAXKEYSIZE key 显式拒（Rule 12 fail visibly）
+        // LMDB 默认页大小 4096 → MDB_MAXKEYSIZE = 511。空 key 直接 BadValSize。
+        if key.is_empty() {
+            return Err(StoreError::InvalidKey("empty key rejected"));
+        }
+        const LMDB_MAX_KEY: usize = 511;
+        if key.len() > LMDB_MAX_KEY {
+            return Err(StoreError::InvalidKey(
+                "key exceeds LMDB MDB_MAXKEYSIZE (511)",
+            ));
+        }
         let start = std::time::Instant::now();
         let mut wtxn = self.env.write_txn()?;
         // 单写事务内完成：读旧值（覆盖时减配额）+ 配额校验 + 写 locator + 写配额
@@ -181,7 +192,16 @@ impl KvStore {
         if let Err(e) = wtxn.commit() {
             tracing::warn!(key_hash = fnv1a(key), err = ?e, "put_kv commit failed, rewinding segment");
             if let Ok(mut pool) = self.pool.lock() {
-                let _ = pool.rewind_active_to(loc.seg_id, loc.offset);
+                if let Err(re) = pool.rewind_active_to(loc.seg_id, loc.offset) {
+                    // F-ERR-2：rewind 失败段内留垃圾，显式告警供运维介入
+                    tracing::error!(
+                        key_hash = fnv1a(key),
+                        seg = loc.seg_id,
+                        off = loc.offset,
+                        err = ?re,
+                        "put_kv rewind failed after commit error — segment may leak bytes"
+                    );
+                }
             }
             // E8：MapFull 单独报，caller 可据容量告警
             return Err(classify_heed(e));
