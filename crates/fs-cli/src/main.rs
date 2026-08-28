@@ -354,19 +354,19 @@ async fn cmd_serve(
     // CLI 本地工具常匿名放行；若 FS_AUTH_TOKEN* 已设则按角色门禁（与 daemon 一致）。
     let auth = fs_serve::build_auth_from_env().with_context(|| "load auth tokens from env/file")?;
     let auth_enabled = !auth.is_empty();
-    if !auth_enabled {
-        tracing::warn!("FS_AUTH_TOKEN not set: admin/write endpoints anonymous (loopback only)");
-    }
     // F-SEC-1：监听地址经 --bind/FS_BIND 配置。先解析定 bind_is_loopback（F-OPS-8 /stats 守门用）。
     let ip: std::net::IpAddr = bind
         .parse()
         .with_context(|| format!("invalid --bind/FS_BIND address: {}", bind))?;
-    if !ip.is_loopback() && !auth_enabled {
-        tracing::warn!(
-            bind = %bind,
-            "NON-LOOPBACK bind WITHOUT FS_AUTH_TOKEN — admin/write endpoints exposed unauthenticated. \
-             Set FS_AUTH_TOKEN or bind 127.0.0.1."
-        );
+    let bind_is_loopback = ip.is_loopback();
+    if !auth_enabled && bind_is_loopback {
+        tracing::warn!("FS_AUTH_TOKEN not set: admin/write endpoints anonymous (loopback only)");
+    }
+    if !bind_is_loopback && !auth_enabled {
+        // F-SEC-1 / Rule 12 fail visibly：非环回 + 无 token = 拒绝启动（hard fail）。
+        // 与 fs-serve daemon 一致。容器 --bind 0.0.0.0 场景必踩。
+        fs_serve::enforce_bind_auth_policy(&bind, bind_is_loopback, auth_enabled)
+            .with_context(|| "bind/auth policy")?;
     }
     let state = Arc::new(fs_serve::AppState {
         engine,
@@ -376,7 +376,7 @@ async fn cmd_serve(
         queue_cap: cap,
         knn_sem: Arc::new(tokio::sync::Semaphore::new(fs_serve::KNN_CONCURRENCY)),
         auth: Arc::new(auth),
-        bind_is_loopback: ip.is_loopback(),
+        bind_is_loopback,
     });
     let app = fs_serve::build_router(state);
     let addr = SocketAddr::from((ip, port));

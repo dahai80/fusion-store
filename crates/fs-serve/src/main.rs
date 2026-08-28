@@ -102,19 +102,17 @@ async fn main() -> Result<()> {
     // 全空 = 匿名放行（仅环回安全）。共享逻辑在 fs_serve::build_auth_from_env。
     let auth = fs_serve::build_auth_from_env().context("load auth tokens from env/file")?;
     let auth_enabled = !auth.is_empty();
-    if !auth_enabled {
+    if !auth_enabled && bind_is_loopback {
+        // 环回 + 无 token = 匿名放行（本地调试便利，仅环回安全）
         tracing::warn!(
             "FS_AUTH_TOKEN(_FILE) not set: admin/write endpoints run WITHOUT auth (anonymous). \
              Only safe on 127.0.0.1 loopback; do NOT expose to network without a token."
         );
     }
-    if !bind_is_loopback && !auth_enabled {
-        tracing::warn!(
-            bind = %args.bind,
-            "NON-LOOPBACK bind WITHOUT FS_AUTH_TOKEN — admin/write endpoints exposed unauthenticated. \
-             Set FS_AUTH_TOKEN or bind 127.0.0.1."
-        );
-    }
+    // F-SEC-1 / Rule 12 fail visibly：非环回 + 无 token = 拒绝启动（hard fail）。
+    // 旧实现仅 warn 继续 listen → admin/write 端点裸奔。容器 --bind 0.0.0.0 场景必踩。
+    fs_serve::enforce_bind_auth_policy(&args.bind, bind_is_loopback, auth_enabled)
+        .context("bind/auth policy")?;
 
     let state = Arc::new(AppState {
         engine,

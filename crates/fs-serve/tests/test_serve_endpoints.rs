@@ -443,6 +443,32 @@ async fn stats_requires_auth_when_non_loopback() {
     );
 }
 
+// F-SEC-1 / Rule 12 fail visibly：enforce_bind_auth_policy 启动门禁
+// 非环回 + 无 token → Err（拒启动）；环回 + 无 token / 任一 + 有 token → Ok
+#[tokio::test]
+async fn bind_auth_policy_refuses_non_loopback_without_token() {
+    // 非环回 + 无 token → Err（hard fail，不裸奔）
+    assert!(
+        fs_serve::enforce_bind_auth_policy("0.0.0.0", false, false).is_err(),
+        "non-loopback + no token → refuse start (F-SEC-1)"
+    );
+    // 环回 + 无 token → Ok（匿名放行，本地调试）
+    assert!(
+        fs_serve::enforce_bind_auth_policy("127.0.0.1", true, false).is_ok(),
+        "loopback + no token → allow (anonymous safe on loopback)"
+    );
+    // 非环回 + 有 token → Ok（认证保护）
+    assert!(
+        fs_serve::enforce_bind_auth_policy("0.0.0.0", false, true).is_ok(),
+        "non-loopback + token → allow (auth protected)"
+    );
+    // 环回 + 有 token → Ok
+    assert!(
+        fs_serve::enforce_bind_auth_policy("127.0.0.1", true, true).is_ok(),
+        "loopback + token → allow"
+    );
+}
+
 // F-SEC-7：请求体超 16MB → 413 Payload Too Large（反序列化前拦截）
 #[tokio::test]
 async fn body_limit_rejects_oversized_payload() {

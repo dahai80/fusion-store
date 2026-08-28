@@ -309,6 +309,39 @@ pub fn build_auth_from_env() -> Result<AuthConfig, BuildAuthError> {
     Ok(auth)
 }
 
+/// F-SEC-1 / Rule 12 fail visibly：绑定 + 认证策略校验（main + fs-cli serve 共用，可测）。
+/// 返 Ok(()) 表示通过；Err 表示拒绝启动。
+/// - 环回 + 无 token → Ok（匿名放行，本地调试安全）+ warn 由 caller 记
+/// - 非环回 + 无 token → Err（hard fail，admin/write 端点不裸奔）
+/// - 任一 + 有 token → Ok
+pub fn enforce_bind_auth_policy(
+    bind: &str,
+    bind_is_loopback: bool,
+    auth_enabled: bool,
+) -> Result<(), BindAuthPolicyError> {
+    if !auth_enabled && !bind_is_loopback {
+        return Err(BindAuthPolicyError(bind.to_string()));
+    }
+    Ok(())
+}
+
+/// enforce_bind_auth_policy 错误：非环回 + 无 token 拒启动
+#[derive(Debug)]
+pub struct BindAuthPolicyError(pub String);
+
+impl std::fmt::Display for BindAuthPolicyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "NON-LOOPBACK bind ({}) WITHOUT FS_AUTH_TOKEN — refusing to start. \
+             Set FS_AUTH_TOKEN(_FILE) or bind 127.0.0.1.",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for BindAuthPolicyError {}
+
 /// build_auth_from_env 错误（文件读失败或空文件）
 #[derive(Debug)]
 pub struct BuildAuthError(String);

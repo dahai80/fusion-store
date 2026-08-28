@@ -19,6 +19,7 @@
 > **容量边界（F-ARCH-3）**：单层 NSW 无分层/分片捷径，生产建议单 namespace 向量数 **≤1-2M**。
 > 1M×768 实测 p99 1544us（5ms SLA 余量收窄）、写入 48 vecs/s（构建超线性）。超此规模需架构演进
 > （分片多 namespace / 分层 NSW），`/stats` 暴露 `vector_count` 水位供监控触发扩容决策。
+> 演进路径详见 [`ROADMAP.md`](ROADMAP.md)（路径 A 分片 / 路径 B 分层 HNSW + 容量边界表 + 触发信号）。
 
 ## 设计
 
@@ -85,7 +86,7 @@ pub trait FusionStoreEngine {
 
 ## 状态
 
-Greenfield → M0 完成（workspace 骨架 + fs-core trait）。M1 完成（KV + mmap 段）。M2 完成（NSW 图常驻 RAM + snapshot + NEON SIMD 位等 + batch）。M3 完成（Arrow 定长原语列式 + C-ABI + 读强制拷贝 + Python 绑定 fs-ffi-py）。M4 完成（WAL 幂等 + recover + compact COW + fs-serve + 背压 + prometheus + SLA）。审计 30 缺陷全修复（A1-A7 / R1-R10 / E1-E13）+ 生产就绪审计 P0-P3 全修复（见审计纠偏节）。PRD v2.0 roadmap 全里程碑 + 全延后项落地，131 测试全绿（debug + release 双绿，含 9 例 proptest fuzz harness F-TEST-2；fs-ffi-py 7 Python 测试另计，maturin 开发环境）。向量读取/枚举 API（`get_vector`/`list_vector_ids`）+ 删除 API 经 Engine trait → C-ABI → Python 三层全暴露（#2/#3）。RBAC + audit log + token file + body limit + /stats 认证门禁（F-SEC-2/F-SEC-7/F-OPS-8）。
+Greenfield → M0 完成（workspace 骨架 + fs-core trait）。M1 完成（KV + mmap 段）。M2 完成（NSW 图常驻 RAM + snapshot + NEON SIMD 位等 + batch）。M3 完成（Arrow 定长原语列式 + C-ABI + 读强制拷贝 + Python 绑定 fs-ffi-py）。M4 完成（WAL 幂等 + recover + compact COW + fs-serve + 背压 + prometheus + SLA）。审计 30 缺陷全修复（A1-A7 / R1-R10 / E1-E13）+ 生产就绪审计 P0-P3 全修复（见审计纠偏节）。PRD v2.0 roadmap 全里程碑 + 全延后项落地，132 测试全绿（debug + release 双绿，含 9 例 proptest fuzz harness F-TEST-2 + 1 例非环回启动门禁 F-SEC-1；fs-ffi-py 7 Python 测试另计，maturin 开发环境）。向量读取/枚举 API（`get_vector`/`list_vector_ids`）+ 删除 API 经 Engine trait → C-ABI → Python 三层全暴露（#2/#3）。RBAC + audit log + token file + body limit + /stats 认证门禁 + 非环回无 token 拒启动 hard fail（F-SEC-2/F-SEC-7/F-SEC-1/F-OPS-8）。
 
 ### 审计纠偏（A2/A4/A7/E6）
 

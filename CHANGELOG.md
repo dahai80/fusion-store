@@ -4,6 +4,11 @@ fusion-store 版本变更记录。格式遵循 [Keep a Changelog](https://keepac
 
 ## [Unreleased]
 
+### 安全加固
+- F-SEC-1 / Rule 12 fail visibly：非环回绑定（`--bind` 非 127.0.0.1）+ 无 `FS_AUTH_TOKEN` 从「warn 继续」升级为 **hard fail 拒启动**（`enforce_bind_auth_policy`，fs-serve + fs-cli serve 共用）。容器 `--bind 0.0.0.0` 场景必须配 token，否则 daemon 不启动。环回 + 无 token 维持匿名放行（本地调试）。
+
+## [0.1.1] — 2026-08-28
+
 ### 生产就绪审计修复（P0-P3，`audit/fusion-store-audit-result-product-0827.md`）
 
 #### P0
@@ -13,6 +18,7 @@ fusion-store 版本变更记录。格式遵循 [Keep a Changelog](https://keepac
 - CI 矩阵（fmt + clippy + check + test debug/release）+ wheel pytest job + `Cargo.lock` 入仓 + release profile（LTO + strip）+ workspace deps 统一。
 - 部署：Dockerfile + launchd plist + `start.sh` start/stop。
 - 代码：`--bind` 可配 + `EF_SEARCH` 可配 + `KV_MAP_SIZE` 常量化 + metrics 注册降级（重名不 panic）+ rewind/snapshot 日志补全。
+- 安全：非环回 + 无 token 拒启动 hard fail（F-SEC-1 / Rule 12，`enforce_bind_auth_policy`，fs-serve + fs-cli serve 共用，可测）。
 
 #### P2
 - 代码：RBAC 三角色（Admin/Readwrite/Readonly）+ audit log + token 文件回退 + body limit 16MB + `/stats` 非环回认证门禁 + poison lock 指标。

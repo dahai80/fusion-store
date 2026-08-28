@@ -6,7 +6,11 @@
 #     -p 11463:11463 \
 #     -v fusion-store-data:/data \
 #     -e FS_AUTH_TOKEN=<secret> \
-#     fusion-store:latest serve --home /data --port 11463
+#     fusion-store:latest serve --home /data --port 11463 --bind 0.0.0.0
+#
+# F-SEC-1：CMD 默认 --bind 0.0.0.0（非环回），必须配 FS_AUTH_TOKEN，否则 daemon 拒启动
+# （enforce_bind_auth_policy hard fail，Rule 12 fail visibly）。
+# 环回（127.0.0.1）可无 token，但容器内环回不可达外部。
 #
 # 注：fusion-store 定位 Apple Silicon 统一内存 + mmap，容器化仅作部署封装，
 # 跨平台 Linux 构建需 heed/LMDB + mmap 支持（linux/amd64 + linux/arm64均可）。

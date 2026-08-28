@@ -670,7 +670,7 @@ dependencies = [
 
 [[package]]
 name = "fs-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -685,7 +685,7 @@ dependencies = [
 
 [[package]]
 name = "fs-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arrow",
  "bytemuck",
@@ -703,7 +703,7 @@ dependencies = [
 
 [[package]]
 name = "fs-ffi-c"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "fs-core",
  "tempfile",
@@ -712,7 +712,7 @@ dependencies = [
 
 [[package]]
 name = "fs-ffi-py"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "fs-core",
  "pyo3",
@@ -723,7 +723,7 @@ dependencies = [
 
 [[package]]
 name = "fs-serve"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "axum",
