@@ -4,7 +4,14 @@ fusion-store 版本变更记录。格式遵循 [Keep a Changelog](https://keepac
 
 ## [Unreleased]
 
-- NSW 规模演进 Path A：`ShardedEngine` 分片薄层（fan-out 检索 + 路由写 + 归并 top-k，详见 ROADMAP）。排入 0.2.0-rc.2 → 0.2.0。
+### NSW 规模演进 Path A 落地
+- `ShardedEngine` 分片薄层（`crates/fs-core/src/sharded.rs`）—— 持 K 个 `Engine`（各独立目录 + WAL + flock），完整 impl `FusionStoreEngine`，对消费方透明。
+  - 路由：`ShardRouter` trait + 默认 `HashRouter`（向量 id % K / KV key fnv-1a % K），可注入业务键路由免 fan-out。
+  - 检索：`std::thread::scope` 并行 fan-out 查 K 分片，归并全局 top-k（排序取前 K），延迟 = max(分片延迟) 非 sum。
+  - 写：`insert_vector_batch` 按 id 分摊各分片攒批 group commit（不做跨分片原子，2PC 超薄层范围 Rule 2）。
+  - 生命周期：checkpoint/recover/close 全分片顺序调用，任一失败立返 Err。
+- 9 集成测试（`tests/test_sharded.rs`）：多分片建库/路由往返/fan-out 召回 vs 暴力 top-k/batch 分摊/delete+get 路由/list 合并/checkpoint 重开持久化/count 聚合。141 测试 debug+release 双绿。
+- 不改 `NswGraph` 核心（Path A 立场），A4 单 namespace 立场不变（ShardedEngine 是消费方侧多 Engine 编排）。
 
 ## [0.2.0-rc.1] — 2026-08-28 (Pre-release)
 

@@ -57,7 +57,7 @@ cargo clippy -- -D warnings         # lint（警告即错）
 
 ```
 crates/
-  fs-core/    # 引擎核心：mem 段 + KV + NSW 向量 + Arrow 列式 + WAL/recover/compact + trait + StoreError
+  fs-core/    # 引擎核心：mem 段 + KV + NSW 向量 + Arrow 列式 + WAL/recover/compact + trait + StoreError + ShardedEngine 分片薄层
   fs-cli/     # CLI 二进制 fusion-store（init/put/get/stats/compact/recover/serve）
   fs-serve/   # 管理/监控 HTTP daemon（axum + tokio，端口 11463，prometheus 指标 + 背压）
   fs-ffi-c/   # C-ABI 绑定（staticlib + cdylib，导出 fs_store.h）
@@ -86,7 +86,7 @@ pub trait FusionStoreEngine {
 
 ## 状态
 
-Greenfield → M0 完成（workspace 骨架 + fs-core trait）。M1 完成（KV + mmap 段）。M2 完成（NSW 图常驻 RAM + snapshot + NEON SIMD 位等 + batch）。M3 完成（Arrow 定长原语列式 + C-ABI + 读强制拷贝 + Python 绑定 fs-ffi-py）。M4 完成（WAL 幂等 + recover + compact COW + fs-serve + 背压 + prometheus + SLA）。审计 30 缺陷全修复（A1-A7 / R1-R10 / E1-E13）+ 生产就绪审计 P0-P3 全修复（见审计纠偏节）。PRD v2.0 roadmap 全里程碑 + 全延后项落地，132 测试全绿（debug + release 双绿，含 9 例 proptest fuzz harness F-TEST-2 + 1 例非环回启动门禁 F-SEC-1；fs-ffi-py 7 Python 测试另计，maturin 开发环境）。**当前 0.2.0-rc.1（Pre-release，0.2 线 RC 基线）** —— 受控商用 / 技术预览档达标（审计 P0/P1 闭环）；NSW 规模演进（F-ARCH-3，`ShardedEngine` 分片薄层）排入 0.2.0-rc.2 → 0.2.0。向量读取/枚举 API（`get_vector`/`list_vector_ids`）+ 删除 API 经 Engine trait → C-ABI → Python 三层全暴露（#2/#3）。RBAC + audit log + token file + body limit + /stats 认证门禁 + 非环回无 token 拒启动 hard fail（F-SEC-2/F-SEC-7/F-SEC-1/F-OPS-8）。
+Greenfield → M0 完成（workspace 骨架 + fs-core trait）。M1 完成（KV + mmap 段）。M2 完成（NSW 图常驻 RAM + snapshot + NEON SIMD 位等 + batch）。M3 完成（Arrow 定长原语列式 + C-ABI + 读强制拷贝 + Python 绑定 fs-ffi-py）。M4 完成（WAL 幂等 + recover + compact COW + fs-serve + 背压 + prometheus + SLA）。审计 30 缺陷全修复（A1-A7 / R1-R10 / E1-E13）+ 生产就绪审计 P0-P3 全修复（见审计纠偏节）。PRD v2.0 roadmap 全里程碑 + 全延后项落地，141 测试全绿（debug + release 双绿，含 9 例 proptest fuzz harness F-TEST-2 + 1 例非环回启动门禁 F-SEC-1 + 9 例 ShardedEngine 分片测试；fs-ffi-py 7 Python 测试另计，maturin 开发环境）。**当前 0.2.0-rc.1（Pre-release，0.2 线 RC 基线）** —— 受控商用 / 技术预览档达标（审计 P0/P1 闭环）；NSW 规模演进 Path A `ShardedEngine` 分片薄层已落地（见下节），排入 0.2.0-rc.2 → 0.2.0。向量读取/枚举 API（`get_vector`/`list_vector_ids`）+ 删除 API 经 Engine trait → C-ABI → Python 三层全暴露（#2/#3）。RBAC + audit log + token file + body limit + /stats 认证门禁 + 非环回无 token 拒启动 hard fail（F-SEC-2/F-SEC-7/F-SEC-1/F-OPS-8）。
 
 ### 审计纠偏（A2/A4/A7/E6）
 
@@ -179,6 +179,37 @@ Greenfield → M0 完成（workspace 骨架 + fs-core trait）。M1 完成（KV 
 **写入性能修复说明**：原 `insert_batch` 每批 rescan 全部 N 旧向量入 RAM map → O(N²) 拷贝，1M 不可行。改为零拷贝 mmap 切片读（`ZeroCopyVec` 持 Arc<MmapHandle> 保活）+ locator 内存缓存（16B/项元数据，非向量字节，H1 仍向量在 mmap 段）+ 增量连边不复读旧向量。消除每跳 heed read_txn + serde 反序列化 + Vec<f32> 分配。50K×768 写入 ~1195 vecs/s（修前 1M 跑 2hr 仅 ~480K/1M = 67 vecs/s）。
 
 **降规模说明**：M2 用 1000×128 验证图连边、跳转、召回正确性趋势。PRD §2.5 全规模基准（1M×768）留 M4 统一基准（需 WAL 落地后的稳定写入路径 + 真实嵌入向量集）。
+
+## ShardedEngine（NSW 规模演进 Path A）
+
+单层 NSW 单 namespace 软上限 ≤1-2M 向量。`ShardedEngine`（`fs-core::sharded`）在不改 `NswGraph` 核心的前提下，于 `Engine` 之上加薄分片层：一个逻辑库拆 K 个 namespace（各独立 `Engine::open` 目录 + WAL + flock），向量按 id 分片路由，检索 fan-out 并行查 K 分片后归并全局 top-k。
+
+```rust
+use fs_core::sharded::ShardedEngine;
+use fs_core::vector::schema::{VectorSchema, MetricKind};
+
+// 4 分片，每分片建同 schema 向量索引
+let schema = VectorSchema::new(768, MetricKind::Cosine);
+let eng = ShardedEngine::open(&home, 4, Some(schema), 0)?;
+
+// 向量按 id % 4 路由，消费方无感
+for (id, v) in vectors { eng.insert_vector(id, &v, None)?; }
+// fan-out 并行查 4 分片，归并全局 top-10
+let results = eng.search_knn(&query, 10, None)?;
+// KV 按 key fnv hash % 4 路由
+eng.put_kv(b"k", b"v", None)?;
+
+eng.checkpoint()?;   // 全分片顺序 checkpoint
+eng.close()?;        // 全分片顺序关闭
+```
+
+- **路由可注入**：`ShardRouter` trait，默认 `HashRouter`（id % K / key fnv-1a % K）。注入业务键路由（如按 tenant 固定分片）可免 fan-out。
+- **fan-out 并行**：`std::thread::scope` 并行查 K 分片，归并排序取前 top_k，延迟 = max(分片延迟) 非 sum。
+- **完整 impl `FusionStoreEngine`**：对消费方透明，一个句柄操作整个分片库。checkpoint/recover/close 全分片顺序调用。
+- **不做跨分片原子**：`insert_vector_batch` 按 id 分摊各分片独立 group commit，跨分片 2PC 超薄层范围（Rule 2），消费方按业务容忍。
+- **A4 立场不变**：单 `Engine` 仍是单 namespace；ShardedEngine 是消费方侧多 Engine 编排，非单引擎内多 namespace 路由。K 增长时 fd/mmap 随之膨胀，触及 macOS 系统上限由消费方控制。
+
+容量演进决策见 [`ROADMAP.md`](ROADMAP.md)（路径 A 分片 ≤10M / 路径 B 分层 HNSW 单分片 5M+）。
 
 ## C-ABI（fs-ffi-c）
 

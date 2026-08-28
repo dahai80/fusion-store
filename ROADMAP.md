@@ -1,6 +1,6 @@
 # Roadmap
 
-fusion-store 演进路线。当前 **0.2.0-rc.1**（0.2 线 RC 基线，受控商用 / 技术预览）。本文件记架构演进方向与容量边界，不承诺版本号时间。
+fusion-store 演进路线。当前 **0.2.0-rc.1**（0.2 线 RC 基线，受控商用 / 技术预览）。**Path A `ShardedEngine` 分片薄层已落地**（0.2.0-rc.1，见下）。本文件记架构演进方向与容量边界，不承诺版本号时间。
 
 ## 容量边界（当前 0.1.x）
 
@@ -40,8 +40,17 @@ fusion-store 演进路线。当前 **0.2.0-rc.1**（0.2 线 RC 基线，受控�
 
 ### 决策
 
-0.1.x ~ 0.2.x：**路径 A**（分片）为主——零核心改动，消费方可控，覆盖 ≤10M 量级。`ShardedEngine` 薄层排入 0.2.x。
+0.1.x ~ 0.2.x：**路径 A**（分片）为主——零核心改动，消费方可控，覆盖 ≤10M 量级。`ShardedEngine` 薄层**已在 0.2.0-rc.1 落地**（`crates/fs-core/src/sharded.rs`，9 集成测试绿）。
 1.0+：若出现单分片 5M+ 强需求，评估路径 B（分层 HNSW）核心重构，独立 milestone。当前不排期，避免发布门禁阶段引入不可控算法变更（Rule 2/3/10）。
+
+### Path A 落地状态（0.2.0-rc.1）
+
+- `ShardedEngine`（`fs-core::sharded`）：持 K 个 `Engine`（各独立目录 + WAL + flock），完整 impl `FusionStoreEngine`，对消费方透明。
+- 路由：`ShardRouter` trait + 默认 `HashRouter`（向量 id % K / KV key fnv % K）。可注入业务键路由。
+- 检索：`std::thread::scope` 并行 fan-out 查 K 分片，归并全局 top-k（排序取前 K）。
+- 写：`insert_vector_batch` 按 id 分摊到各分片攒批 group commit（不做跨分片原子，2PC 超薄层范围，Rule 2）。
+- 生命周期：checkpoint/recover/close 全分片顺序调用。
+- 验证：9 集成测试（多分片建库/路由往返/fan-out 召回 vs 暴力/batch 分摊/delete+get 路由/list 合并/checkpoint 重开/count 聚合），debug+release 双绿。
 
 ## 分片多 namespace（A4 演进）
 

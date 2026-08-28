@@ -10,6 +10,7 @@ pub mod engine;
 pub mod engine_impl;
 pub mod error;
 pub mod mem;
+pub mod sharded;
 pub mod store;
 pub mod vector;
 
