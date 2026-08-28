@@ -4,8 +4,29 @@ fusion-store 版本变更记录。格式遵循 [Keep a Changelog](https://keepac
 
 ## [Unreleased]
 
-### 安全加固
-- F-SEC-1 / Rule 12 fail visibly：非环回绑定（`--bind` 非 127.0.0.1）+ 无 `FS_AUTH_TOKEN` 从「warn 继续」升级为 **hard fail 拒启动**（`enforce_bind_auth_policy`，fs-serve + fs-cli serve 共用）。容器 `--bind 0.0.0.0` 场景必须配 token，否则 daemon 不启动。环回 + 无 token 维持匿名放行（本地调试）。
+- NSW 规模演进 Path A：`ShardedEngine` 分片薄层（fan-out 检索 + 路由写 + 归并 top-k，详见 ROADMAP）。排入 0.2.0-rc.2 → 0.2.0。
+
+## [0.2.0-rc.1] — 2026-08-28 (Pre-release)
+
+### 定位
+
+**0.2 线首个 Release Candidate 基线**，非 feature-complete 候选。
+
+- 当前态 = 受控商用 / 技术预览（审计 P0/P1 闭环，与 0.1.1 一致）。
+- 本 RC 在 `ShardedEngine` 落地前作为基线锚点，便于后续演进以 rc.2 → 0.2.0 稳定迭代。
+- 未含新功能：代码面与 0.1.1 相同。版本号上开 0.2 线，宣告进入 NSW 规模演进周期（ROADMAP Path A）。
+- **Pre-release**：不建议直接用于无条件企业级生产商用。差距 = NSW 演进（F-ARCH-3，单层 NSW ≤1-2M 仅文档化）。
+
+### 已知限制（沿用 0.1.1）
+
+- 单层 NSW，无分层/分片，单 namespace 向量数软上限 ≤1-2M（`/stats` `vector_count` 暴露水位）。
+- 零拷贝仅 Rust 进程内；C/Python 经 C-ABI 读强制拷贝（A7）。
+- 单 namespace = 单 `Engine` 实例；多 namespace 是消费方职责（A4）。
+
+### CI / 产物
+
+- GitHub Actions runner 仍被账户 billing 阻断（非代码问题），wheel 产物暂不可自动构建。
+- tag `v0.2.0-rc.1` + GitHub Pre-release 已落地。billing 解后 `gh run rerun` 触发 wheel。
 
 ## [0.1.1] — 2026-08-28
 
