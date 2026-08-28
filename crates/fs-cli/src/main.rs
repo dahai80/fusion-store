@@ -12,15 +12,13 @@
 //! 日志走 stderr，stdout 仅输出结果（供脚本/测试解析）。
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use fs_core::compact::run_compact;
-use fs_core::mem::recover;
+use fs_core::mem::recover::build_recover_plan;
 use fs_core::vector::schema::{MetricKind, VectorSchema};
-use fs_core::vector::store::VectorIndex;
-use fs_core::KvStore;
+use fs_core::{Engine, FusionStoreEngine};
 
 #[derive(Parser)]
 #[command(name = "fusion-store", version, about = "fusion-store 管理命令")]
@@ -74,7 +72,7 @@ enum Cmd {
         #[arg(long, default_value_t = 0)]
         seg_size: u64,
     },
-    /// 物理清理软删向量 + 重建 HNSW 图 snapshot（COW 原子切换）
+    /// 物理清理软删向量 + 重建 NSW 图 snapshot（COW 原子切换）
     Compact {
         #[arg(long, default_value = "default")]
         namespace: String,
@@ -164,39 +162,39 @@ async fn main() -> Result<()> {
 
 // ---- 子命令实现（占位，下方 Edit 填充） ----
 
-fn cmd_init(home: &Path, ns: &str, seg_size: u64, quota: u64, dim: usize) -> Result<()> {
+fn cmd_init(home: &Path, ns: &str, _seg_size: u64, quota: u64, dim: usize) -> Result<()> {
     let dir = home.join(ns);
     std::fs::create_dir_all(&dir)?;
-    let _store = KvStore::open(&dir, seg_size, quota)
-        .with_context(|| format!("init kv namespace {}", ns))?;
-    // 建向量索引（登记 VectorSchema dim/metric，§1.4）
     let schema = VectorSchema::new(dim, MetricKind::L2);
-    let _idx = VectorIndex::open(&dir, schema, seg_size)
-        .with_context(|| format!("init vector index namespace {}", ns))?;
+    let _engine = Engine::open(&dir, Some(schema), quota)
+        .with_context(|| format!("init engine namespace {}", ns))?;
     println!("initialized: {} (dim={})", dir.display(), dim);
     Ok(())
 }
 
-fn cmd_put(home: &Path, ns: &str, key: &str, value: &str, seg_size: u64, quota: u64) -> Result<()> {
+fn cmd_put(
+    home: &Path,
+    ns: &str,
+    key: &str,
+    value: &str,
+    _seg_size: u64,
+    quota: u64,
+) -> Result<()> {
     let dir = home.join(ns);
-    let store =
-        KvStore::open(&dir, seg_size, quota).with_context(|| format!("open namespace {}", ns))?;
-    store
-        .put_kv(
-            key.as_bytes(),
-            value.as_bytes(),
-            Some(Duration::from_secs(5)),
-        )
+    let engine = Engine::open_kv_only(&dir, quota)
+        .with_context(|| format!("open engine namespace {}", ns))?;
+    engine
+        .put_kv(key.as_bytes(), value.as_bytes(), None)
         .map_err(|e| anyhow::anyhow!("put failed: {e}"))?;
     println!("put ok: {} ({}B)", key, value.len());
     Ok(())
 }
 
-fn cmd_get(home: &Path, ns: &str, key: &str, seg_size: u64) -> Result<()> {
+fn cmd_get(home: &Path, ns: &str, key: &str, _seg_size: u64) -> Result<()> {
     let dir = home.join(ns);
-    let store =
-        KvStore::open(&dir, seg_size, 0).with_context(|| format!("open namespace {}", ns))?;
-    match store.get_kv_zero_copy(key.as_bytes(), None) {
+    let engine =
+        Engine::open_kv_only(&dir, 0).with_context(|| format!("open engine namespace {}", ns))?;
+    match engine.get_kv_zero_copy(key.as_bytes(), None) {
         Ok(Some(buf)) => {
             let owned = buf.to_owned_slice();
             println!("{}", String::from_utf8_lossy(&owned));
@@ -210,38 +208,56 @@ fn cmd_get(home: &Path, ns: &str, key: &str, seg_size: u64) -> Result<()> {
     Ok(())
 }
 
-fn cmd_stats(home: &Path, ns: &str, seg_size: u64) -> Result<()> {
+fn cmd_stats(home: &Path, ns: &str, _seg_size: u64) -> Result<()> {
     let dir = home.join(ns);
-    let kv =
-        KvStore::open(&dir, seg_size, 0).with_context(|| format!("open kv namespace {}", ns))?;
-    let used = kv.used_bytes()?;
-    let quota = kv.quota_limit();
-    let idx = VectorIndex::reopen(&dir, seg_size)
-        .with_context(|| format!("open vector index namespace {}", ns))?;
+    let engine =
+        Engine::open(&dir, None, 0).with_context(|| format!("open engine namespace {}", ns))?;
+    let used = engine.kv().used_bytes()?;
+    let quota = engine.kv().quota_limit();
+    let kv_disk = engine.kv().disk_bytes()?;
+    let g = engine.vec_index()?;
+    let idx = g.as_ref().unwrap();
+    let vec_disk = idx.disk_bytes()?;
     println!("namespace: {}", ns);
     println!("kv_used_bytes: {}", used);
     println!("kv_quota: {}", quota);
+    println!("kv_disk_bytes: {}", kv_disk);
+    println!("vec_disk_bytes: {}", vec_disk);
     println!("vector_count: {}", idx.len());
     println!("vector_dim: {}", idx.schema().dim);
     println!("graph_memory_bytes: {}", idx.graph_memory_usage());
     Ok(())
 }
 
-fn cmd_compact(home: &Path, ns: &str, seg_size: u64, reclaim_now: bool) -> Result<()> {
+fn cmd_compact(home: &Path, ns: &str, _seg_size: u64, reclaim_now: bool) -> Result<()> {
     let dir = home.join(ns);
-    // reopen 不需 schema，从持久化 snapshot 恢复
-    let idx = VectorIndex::reopen(&dir, seg_size)
-        .with_context(|| format!("open vector index namespace {}", ns))?;
-    let res = run_compact(&idx)?;
+    let engine =
+        Engine::open(&dir, None, 0).with_context(|| format!("open engine namespace {}", ns))?;
+    let res = {
+        let g = engine.vec_index()?;
+        let idx = g.as_ref().unwrap();
+        run_compact(idx)?
+    };
     println!(
         "compact ok: live_vectors={}, reclaimable_segs={}",
         res.live_vectors,
         res.reclaimable_segs.len()
     );
     if reclaim_now && !res.reclaimable_segs.is_empty() {
-        // CLI 直接回收（假定无 in-flight reader，单用户管理态）
-        fs_core::compact::reclaim(&idx, &res.reclaimable_segs)?;
-        println!("reclaimed {} old segment(s)", res.reclaimable_segs.len());
+        let g = engine.vec_index()?;
+        let idx = g.as_ref().unwrap();
+        let n = fs_core::compact::reclaim(idx, &res.reclaimable_segs)?;
+        // E7：reclaim 内部按安全期校验，可能跳过未达下限的段——报实际回收数
+        if n < res.reclaimable_segs.len() {
+            println!(
+                "reclaimed {} of {} old segment(s); {} skipped (sealed < safety period, retry later)",
+                n,
+                res.reclaimable_segs.len(),
+                res.reclaimable_segs.len() - n
+            );
+        } else {
+            println!("reclaimed {} old segment(s)", n);
+        }
     } else if !res.reclaimable_segs.is_empty() {
         println!(
             "note: old segments pending reclaim (safety period). pass --reclaim-now to delete."
@@ -251,32 +267,36 @@ fn cmd_compact(home: &Path, ns: &str, seg_size: u64, reclaim_now: bool) -> Resul
 }
 
 fn cmd_recover(home: &Path, ns: &str, dry_run: bool) -> Result<()> {
-    let wal_dir = home.join(ns).join("wal");
-    let plan = recover::build_recover_plan(&wal_dir)
-        .with_context(|| format!("build recover plan namespace {}", ns))?;
-    println!(
-        "recover plan: applied_seq={}, to_replay={}, registered_blocks={}",
-        plan.applied_seq,
-        plan.entries.len(),
-        plan.registered_blocks.len()
-    );
-    for e in &plan.entries {
-        println!("  replay seq={} op={:?}", e.seq, e.op);
-    }
+    let dir = home.join(ns);
+    let wal_dir = dir.join("wal");
     if dry_run {
-        println!("dry_run: WAL not truncated");
-    } else if !plan.entries.is_empty() {
-        // 幂等重放由引擎层在 open 时自动做；CLI 此处确认后截断 WAL 防无限增长
-        let max_seq = plan
-            .entries
-            .iter()
-            .map(|e| e.seq)
-            .max()
-            .unwrap_or(plan.applied_seq);
-        recover::finalize_recover(&wal_dir, max_seq)?;
-        println!("recover ok: WAL truncated to seq={}", max_seq);
+        // dry_run 仅读 plan 报告，不 apply 不截断
+        let plan = build_recover_plan(&wal_dir)
+            .with_context(|| format!("build recover plan namespace {}", ns))?;
+        println!(
+            "recover plan: applied_seq={}, to_replay={}",
+            plan.applied_seq,
+            plan.entries.len()
+        );
+        for e in &plan.entries {
+            println!("  replay seq={} op={:?}", e.seq, e.op);
+        }
+        println!("dry_run: WAL not applied, not truncated");
+        return Ok(());
+    }
+    // 非 dry_run：Engine::open 内嵌自动 recover（A2：recover 是 open 副作用，非独立动作）
+    let _engine = Engine::open(&dir, None, 0)
+        .with_context(|| format!("engine open + auto-recover namespace {}", ns))?;
+    // 重放后 WAL 已截断到 max_seq（finalize_recover 在 open 内调）
+    // A1：Engine 持 Wal 排他 flock，不可再 build_recover_plan 重开 → 用 Engine 内省
+    let plan_after = _engine.pending_recover_plan()?;
+    if plan_after.entries.is_empty() {
+        println!("recover ok: WAL replayed + truncated, nothing pending");
     } else {
-        println!("recover: nothing to replay, WAL already checkpointed");
+        println!(
+            "recover ok: {} entry(ies) still pending after open",
+            plan_after.entries.len()
+        );
     }
     Ok(())
 }
@@ -287,19 +307,20 @@ async fn cmd_serve(
     port: u16,
     dim: usize,
     queue_cap: usize,
-    seg_size: u64,
+    _seg_size: u64,
     quota: u64,
 ) -> Result<()> {
     use std::net::SocketAddr;
     use std::sync::Arc;
     use tokio::sync::mpsc;
 
+    use fs_core::vector::schema::{MetricKind, VectorSchema};
+
     let ns_dir = home.join(ns);
     std::fs::create_dir_all(&ns_dir).context("create namespace dir")?;
-    let kv = Arc::new(KvStore::open(&ns_dir, seg_size, quota).context("open kv store")?);
     let schema = VectorSchema::new(dim, MetricKind::L2);
-    let vec_index =
-        Arc::new(VectorIndex::open(&ns_dir, schema, seg_size).context("open vector index")?);
+    let engine =
+        Arc::new(Engine::open(&ns_dir, Some(schema), quota).context("open engine (kv+vec+wal)")?);
     let cap = if queue_cap == 0 {
         fs_serve::DEFAULT_QUEUE_CAP
     } else {
@@ -309,15 +330,31 @@ async fn cmd_serve(
     let queue_depth = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let compact_in_progress = Arc::new(std::sync::atomic::AtomicBool::new(false));
     fs_serve::metrics::init();
-    fs_serve::refresh_seg_metrics(&kv);
-    let _worker = fs_serve::spawn_write_worker(kv.clone(), queue_depth.clone(), rx);
+    fs_serve::refresh_seg_metrics(&engine);
+    let _workers = fs_serve::spawn_write_worker_pool(
+        engine.clone(),
+        queue_depth.clone(),
+        rx,
+        fs_serve::WRITE_WORKERS,
+    );
+    // R10：CLI serve 不绑 auth token（本地工具，匿名放行 + 强警告）
+    let auth_token = match std::env::var("FS_AUTH_TOKEN") {
+        Ok(t) if !t.is_empty() => Some(t),
+        _ => {
+            tracing::warn!(
+                "FS_AUTH_TOKEN not set: admin/write endpoints anonymous (loopback only)"
+            );
+            None
+        }
+    };
     let state = Arc::new(fs_serve::AppState {
-        kv,
-        vec_index,
+        engine,
         queue_depth,
         compact_in_progress,
         write_tx: tx,
         queue_cap: cap,
+        knn_sem: Arc::new(tokio::sync::Semaphore::new(fs_serve::KNN_CONCURRENCY)),
+        auth_token,
     });
     let app = fs_serve::build_router(state);
     let addr = SocketAddr::from(([127, 0, 0, 1], port));

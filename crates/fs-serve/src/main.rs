@@ -10,9 +10,11 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::Parser;
 use fs_core::vector::schema::{MetricKind, VectorSchema};
-use fs_core::vector::store::VectorIndex;
-use fs_core::KvStore;
-use fs_serve::{build_router, metrics, spawn_write_worker, AppState, DEFAULT_PORT};
+use fs_core::Engine;
+use fs_serve::{
+    build_router, metrics, spawn_write_worker_pool, AppState, DEFAULT_PORT, KNN_CONCURRENCY,
+    WRITE_WORKERS,
+};
 use tokio::sync::mpsc;
 
 #[derive(Parser)]
@@ -37,8 +39,9 @@ struct Args {
     /// 写队列上限（背压触发线，0=默认 10K）
     #[arg(long, default_value_t = 0)]
     queue_cap: usize,
-    /// 段容量字节（0=默认）
+    /// 段容量字节（0=默认，Engine 内部默认 64MB，此参数保留兼容 CLI）
     #[arg(long, default_value_t = 0)]
+    #[allow(dead_code)]
     seg_size: u64,
     /// KV 配额上限字节（0=不限）
     #[arg(long, default_value_t = 0)]
@@ -59,10 +62,10 @@ async fn main() -> Result<()> {
     let ns_dir = home.join(&args.namespace);
     std::fs::create_dir_all(&ns_dir).context("create namespace dir")?;
 
-    let kv = Arc::new(KvStore::open(&ns_dir, args.seg_size, args.quota).context("open kv store")?);
     let schema = VectorSchema::new(args.dim, MetricKind::L2);
-    let vec_index =
-        Arc::new(VectorIndex::open(&ns_dir, schema, args.seg_size).context("open vector index")?);
+    let engine = Arc::new(
+        Engine::open(&ns_dir, Some(schema), args.quota).context("open engine (kv+vec+wal)")?,
+    );
     let queue_cap = if args.queue_cap == 0 {
         fs_serve::DEFAULT_QUEUE_CAP
     } else {
@@ -74,23 +77,40 @@ async fn main() -> Result<()> {
 
     // 初始化 prometheus 指标 + 段使用率初值
     metrics::init();
-    fs_serve::refresh_seg_metrics(&kv);
+    fs_serve::refresh_seg_metrics(&engine);
 
-    // 后台写 worker：消费队列执行 KV put（单写者，降 flock 竞争 R1）
-    let _worker = spawn_write_worker(kv.clone(), queue_depth.clone(), rx);
+    // R3：写 worker 池（多线程并发消费队列，破单线程串行瓶颈）
+    let _workers = spawn_write_worker_pool(engine.clone(), queue_depth.clone(), rx, WRITE_WORKERS);
 
+    // R4：KNN 并发上限信号量
+    let knn_sem = Arc::new(tokio::sync::Semaphore::new(KNN_CONCURRENCY));
+
+    // R10：管理/写端点 Bearer Token 认证。FS_AUTH_TOKEN 未设 = 匿名放行（强警告）。
+    let auth_token = match std::env::var("FS_AUTH_TOKEN") {
+        Ok(t) if !t.is_empty() => Some(t),
+        _ => {
+            tracing::warn!(
+                "FS_AUTH_TOKEN not set: admin/write endpoints run WITHOUT auth (anonymous). \
+                 Only safe on 127.0.0.1 loopback; do NOT expose to network without a token."
+            );
+            None
+        }
+    };
+
+    let auth_enabled = auth_token.is_some();
     let state = Arc::new(AppState {
-        kv,
-        vec_index,
+        engine,
         queue_depth,
         compact_in_progress,
         write_tx: tx,
         queue_cap,
+        knn_sem,
+        auth_token,
     });
     let app = build_router(state);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], args.port));
-    tracing::info!(addr = %addr, namespace = %args.namespace, "fs-serve listening");
+    tracing::info!(addr = %addr, namespace = %args.namespace, auth = auth_enabled, "fs-serve listening");
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())

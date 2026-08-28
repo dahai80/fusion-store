@@ -7,7 +7,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use fs_core::{KvStore, StoreError};
+use fs_core::{Engine, FusionStoreEngine, KvStore, StoreError};
 use tempfile::tempdir;
 
 fn open(dir: &Path, quota: u64) -> KvStore {
@@ -110,12 +110,14 @@ fn scale_write_then_verify() {
 #[test]
 fn multi_process_read_via_fs_cli() {
     // 多进程并发读验收：fs-cli 子进程读，模拟跨进程 reader
+    // F1：写入经 Engine（WAL+kv/ 子目录布局），子进程 fs-cli 经同一 Engine 路径读
     let root = tempdir().unwrap();
     let ns = root.path().join("mp");
-    // 用主进程写
-    let store = open(&ns, 0);
-    store.put_kv(b"mp-key", b"mp-value", None).unwrap();
-    drop(store);
+    // 用主进程经 Engine 写（落地 kv/ 子目录 + WAL）
+    {
+        let engine = Engine::open_kv_only(&ns, 0).unwrap();
+        engine.put_kv(b"mp-key", b"mp-value", None).unwrap();
+    }
     // 子进程读（fs-cli get）—— 真实第二进程
     let bin = fs_cli_bin();
     let out = Command::new(&bin)

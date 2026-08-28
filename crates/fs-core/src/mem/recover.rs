@@ -1,25 +1,19 @@
-//! Recover —— WAL 幂等重放 + 块泄漏防护 [v2 §2.7/R2]
+//! Recover —— WAL 幂等重放 [v2 §2.7/R2]
 //!
 //! recover 流程（PRD §2.7）：
 //!   1. 读 checkpoint.marker.applied_seq
-//!   2. 读 WAL，取 seq > applied_seq 的条目
+//!   2. 读 WAL，取 seq > applied_seq 的条目（F5：torn-tail 容错）
 //!   3. 重放：幂等（insert 查 id 存在性跳过，put_kv 覆盖，delete 幂等）
-//!   4. 块泄漏防护：每条记 (seg_id, offset)，recover 回滚未登记块
-//!   5. 重放完截断 WAL
+//!   4. 重放完截断 WAL
 //!
-//! 本模块只产 RecoverPlan（待重放条目 + 待回滚块），不直接改 kv/vector 状态 ——
-//! 引擎层消费 plan 执行重放（Rule 3 外科式：不入侵现有 store）。幂等判定由引擎层
-//! 在 apply 时做（insert 查 id 存在性），recover 提供 plan + 块回滚登记表。
+//! 逻辑 WAL（F2）后不再做物理块登记回滚：重放经子模块幂等方法重新落段，
+//! 旧段空字节的回收由 compact 负责，而非 recover 回滚未登记块。recover 仅产
+//! 待重放条目 plan，引擎层消费执行重放（Rule 3 外科式：不入侵现有 store）。
 
-use std::collections::HashSet;
 use std::path::Path;
 
 use crate::error::Result;
-use crate::mem::segment::ValueLocator;
-use crate::mem::wal::{Wal, WalEntry, WalOp};
-
-/// 块泄漏防护：记录已登记的 (seg_id, offset)
-pub type RegisteredBlocks = HashSet<(u32, u32)>;
+use crate::mem::wal::{Wal, WalEntry};
 
 /// recover 产出的重放计划 —— 引擎层消费
 #[derive(Debug, Default)]
@@ -28,12 +22,10 @@ pub struct RecoverPlan {
     pub entries: Vec<WalEntry>,
     /// checkpoint 的 applied_seq
     pub applied_seq: u64,
-    /// 所有 WAL 条目登记的块 (seg_id, offset) —— 引擎层对照段已用范围回滚未登记块
-    pub registered_blocks: RegisteredBlocks,
 }
 
-/// 执行 recover 前半段：读 marker + 过滤待重放条目 + 收集登记块。
-/// 不截断 WAL（截断在 checkpoint 后做，或引擎确认重放成功后调 truncate）。
+/// 执行 recover 前半段：读 marker + 过滤待重放条目。
+/// 不截断 WAL（截断在引擎确认重放成功后调 finalize_recover）。
 pub fn build_recover_plan(wal_dir: &Path) -> Result<RecoverPlan> {
     let wal = Wal::open(wal_dir)?;
     let applied_seq = match wal.read_marker()? {
@@ -46,23 +38,15 @@ pub fn build_recover_plan(wal_dir: &Path) -> Result<RecoverPlan> {
         .filter(|e| e.seq > applied_seq)
         .cloned()
         .collect();
-    let mut registered = RegisteredBlocks::new();
-    for e in &all {
-        if let Some(loc) = entry_loc(&e.op) {
-            registered.insert((loc.seg_id, loc.offset));
-        }
-    }
     tracing::info!(
         applied_seq,
         total = all.len(),
         to_replay = entries.len(),
-        registered_blocks = registered.len(),
         "recover plan built"
     );
     Ok(RecoverPlan {
         entries,
         applied_seq,
-        registered_blocks: registered,
     })
 }
 
@@ -72,26 +56,11 @@ pub fn finalize_recover(wal_dir: &Path, applied_seq: u64) -> Result<()> {
     wal.truncate_to(applied_seq)
 }
 
-fn entry_loc(op: &WalOp) -> Option<&ValueLocator> {
-    match op {
-        WalOp::PutKv { loc, .. } | WalOp::InsertVector { loc, .. } => Some(loc),
-        WalOp::DeleteKv { .. } | WalOp::DeleteVector { .. } => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::mem::wal::{CheckpointMarker, Wal, WalOp};
     use tempfile::tempdir;
-
-    fn loc(seg: u32, off: u32, len: u32) -> ValueLocator {
-        ValueLocator {
-            seg_id: seg,
-            offset: off,
-            len,
-        }
-    }
 
     #[test]
     fn plan_replays_only_after_applied_seq() {
@@ -102,22 +71,22 @@ mod tests {
             // seq 1..4
             wal.append(WalOp::PutKv {
                 key: b"a".to_vec(),
-                loc: loc(0, 0, 4),
+                value: b"va".to_vec(),
             })
             .unwrap();
             wal.append(WalOp::InsertVector {
                 id: 1,
-                loc: loc(0, 4, 8),
+                vector: vec![0.1, 0.2],
             })
             .unwrap();
             wal.append(WalOp::PutKv {
                 key: b"b".to_vec(),
-                loc: loc(0, 12, 4),
+                value: b"vb".to_vec(),
             })
             .unwrap();
             wal.append(WalOp::InsertVector {
                 id: 2,
-                loc: loc(0, 16, 8),
+                vector: vec![0.3, 0.4],
             })
             .unwrap();
             // checkpoint applied_seq=2
@@ -134,11 +103,6 @@ mod tests {
         assert_eq!(plan.entries.len(), 2);
         assert_eq!(plan.entries[0].seq, 3);
         assert_eq!(plan.entries[1].seq, 4);
-        // 登记块含全部 4 条 Put/Insert 的 (seg,off)
-        assert!(plan.registered_blocks.contains(&(0, 0)));
-        assert!(plan.registered_blocks.contains(&(0, 4)));
-        assert!(plan.registered_blocks.contains(&(0, 12)));
-        assert!(plan.registered_blocks.contains(&(0, 16)));
     }
 
     #[test]
@@ -153,8 +117,6 @@ mod tests {
         let plan = build_recover_plan(&wal_dir).unwrap();
         assert_eq!(plan.applied_seq, 0);
         assert_eq!(plan.entries.len(), 2);
-        // Delete 无 loc，登记块为空
-        assert!(plan.registered_blocks.is_empty());
     }
 
     #[test]
@@ -166,7 +128,7 @@ mod tests {
             for i in 0..6u64 {
                 wal.append(WalOp::InsertVector {
                     id: i,
-                    loc: loc(0, (i * 8) as u32, 8),
+                    vector: vec![i as f32],
                 })
                 .unwrap();
             }
@@ -187,23 +149,21 @@ mod tests {
     }
 
     #[test]
-    fn double_recover_no_duplicate_blocks() {
-        // R2：重复 recover 不产重复向量/块泄漏 —— plan 本身幂等（纯读）
+    fn double_recover_plan_is_idempotent() {
+        // R2：重复 recover plan 完全一致（纯读，无累积）
         let dir = tempdir().unwrap();
         let wal_dir = dir.path().to_path_buf();
         {
             let mut wal = Wal::open(&wal_dir).unwrap();
             wal.append(WalOp::PutKv {
                 key: b"k".to_vec(),
-                loc: loc(0, 0, 4),
+                value: b"v".to_vec(),
             })
             .unwrap();
         }
         let p1 = build_recover_plan(&wal_dir).unwrap();
         let p2 = build_recover_plan(&wal_dir).unwrap();
-        // 两次 plan 完全一致，无累积/无重复
         assert_eq!(p1.entries.len(), p2.entries.len());
         assert_eq!(p1.applied_seq, p2.applied_seq);
-        assert_eq!(p1.registered_blocks.len(), p2.registered_blocks.len());
     }
 }

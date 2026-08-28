@@ -9,14 +9,16 @@
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use arrow::array::{
     ArrayRef, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
 };
 use arrow::buffer::{Buffer, ScalarBuffer};
 use arrow::datatypes::DataType;
+use fs2::FileExt;
 use heed::types::Bytes;
-use heed::{Database, Env, EnvOpenOptions};
+use heed::{Database, Env, EnvOpenOptions, RoTxn, RwTxn};
 
 use crate::columnar::types::{ColType, ColumnMeta, TableMeta};
 use crate::error::Result;
@@ -26,12 +28,18 @@ use crate::StoreError;
 
 /// 表元信息 heed 库名
 const COL_TABLE_DB: &str = "col_tables";
+/// 列式配额计数 DB（A3：与 KV 对称，key=固定 "used" -> u64 字节）
+const COL_QUOTA_DB: &str = "col_quota";
+const COL_QUOTA_KEY: &[u8] = b"used";
 
 /// 列式存储 —— 单 namespace
 pub struct ColumnarStore {
     env: Env,
     table_db: Database<Bytes, Bytes>,
+    quota_db: Database<Bytes, Bytes>,
     pool: Mutex<SegmentPool>,
+    lock_file: std::fs::File,
+    quota_limit: u64,
 }
 
 // —— 零拷贝 Buffer owner：Arc<MmapHandle> 持有 mmap，Arc 归零时释放映射 ——
@@ -45,28 +53,68 @@ struct MmapAllocation {
 
 impl ColumnarStore {
     /// 打开/创建列式 store。data_dir = ns_dir/col_data，meta_dir = ns_dir/meta
-    pub fn open(namespace_dir: &Path, seg_size: u64) -> Result<Self> {
+    /// quota_limit=0 表示不限（A3：与 KV 配额对称）
+    pub fn open(namespace_dir: &Path, seg_size: u64, quota_limit: u64) -> Result<Self> {
         let data_dir = namespace_dir.join("col_data");
         let meta_dir = namespace_dir.join("meta");
         std::fs::create_dir_all(&meta_dir)?;
         std::fs::create_dir_all(&data_dir)?;
+        // L4：flock 多进程写互斥（与 KvStore 一致，try_lock 快速失败）
+        let lock_path = namespace_dir.join("col.lock");
+        let lock_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)?;
         let env = unsafe {
             EnvOpenOptions::new()
-                .map_size(256 * 1024 * 1024)
+                // E8：map_size 提至 2GB，免 table_meta 膨胀触 MapFull panic
+                .map_size(2 * 1024 * 1024 * 1024)
                 .max_dbs(8)
+                // NO_SYNC：WAL 唯一 crash-safe 同步点（H5）， heed 仅存元数据
+                .flags(heed::EnvFlags::NO_SYNC)
                 .open(&meta_dir)?
         };
         let mut wtxn = env.write_txn()?;
         let table_db: Database<Bytes, Bytes> =
             env.create_database(&mut wtxn, Some(COL_TABLE_DB))?;
+        let quota_db: Database<Bytes, Bytes> =
+            env.create_database(&mut wtxn, Some(COL_QUOTA_DB))?;
         wtxn.commit()?;
         let pool = SegmentPool::open(&data_dir, seg_size)?;
-        tracing::info!(dir = ?namespace_dir, "columnar store opened");
+        tracing::info!(dir = ?namespace_dir, quota_limit, "columnar store opened");
         Ok(Self {
             env,
             table_db,
+            quota_db,
             pool: Mutex::new(pool),
+            lock_file,
+            quota_limit,
         })
+    }
+
+    /// 拿写锁（E9：阻塞 flock，非轮询）。None=内核阻塞 lock_exclusive；Some(d)=限时 5ms 短睡逼近。
+    fn acquire_write_lock(&self, timeout: Option<Duration>) -> Result<()> {
+        match timeout {
+            None => self
+                .lock_file
+                .lock_exclusive()
+                .map_err(|_| StoreError::LockBusy),
+            Some(d) => {
+                let mut waited = Duration::ZERO;
+                loop {
+                    if self.lock_file.try_lock_exclusive().is_ok() {
+                        return Ok(());
+                    }
+                    if waited >= d {
+                        return Err(StoreError::LockBusy);
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                    waited += Duration::from_millis(5);
+                }
+            }
+        }
     }
 
     /// 写列式表：逐列 buffer 落段 + TableMeta 落 heed
@@ -74,50 +122,91 @@ impl ColumnarStore {
         &self,
         table_id: &str,
         batch: &RecordBatch,
-        _timeout: Option<std::time::Duration>,
+        timeout: Option<std::time::Duration>,
     ) -> Result<()> {
+        // L4：flock 多进程写互斥
+        self.acquire_write_lock(timeout)?;
+        let res = self.put_columnar_inner(table_id, batch);
+        let _ = self.lock_file.unlock();
+        res
+    }
+
+    fn put_columnar_inner(&self, table_id: &str, batch: &RecordBatch) -> Result<()> {
         let row_count = batch.num_rows();
         let mut wtxn = self.env.write_txn()?;
-        // 逐列取 raw buffer 字节，落 col 段
-        let mut cols = Vec::with_capacity(batch.num_columns());
-        for i in 0..batch.num_columns() {
-            let col = batch.column(i);
-            let schema = batch.schema();
-            let field = schema.field(i);
-            let dtype = ColType::from_arrow(field.data_type()).ok_or_else(|| {
-                StoreError::Corrupt(format!(
-                    "unsupported column type {:?} (M3: Int32/Int64/Float32/Float64/Boolean only)",
-                    field.data_type()
-                ))
-            })?;
-            // M3：全 non-null，校验 null bitmap 缺席
-            if col.null_count() != 0 {
-                return Err(StoreError::Corrupt(format!(
-                    "column {} has nulls (M3 supports non-null only)",
-                    field.name()
-                )));
+        // A3：配额校验（与 KV 对称）。先读旧表元信息（覆盖时减旧字节）。
+        let old_bytes: u64 = match self.table_db.get(&wtxn, table_id.as_bytes())? {
+            Some(prev) => {
+                let prev_meta: TableMeta = serde_json::from_slice(prev)?;
+                prev_meta.columns.iter().map(|c| c.len as u64).sum()
             }
-            let buf_bytes = primitive_buffer_bytes(field.data_type(), col.as_ref())?;
-            let loc = {
-                let mut pool = self.pool.lock().unwrap();
-                // 定宽列按类型字节宽对齐（i64/f64 需 8 对齐，否则 ScalarBuffer 报未对齐）
-                pool.append_aligned(&buf_bytes, dtype.byte_width())?
-            };
-            cols.push(ColumnMeta {
-                name: field.name().clone(),
-                dtype,
-                seg_id: loc.seg_id,
-                offset: loc.offset,
-                len: loc.len,
-            });
-            tracing::debug!(
+            None => 0,
+        };
+        let used = read_col_quota_txn(&self.quota_db, &wtxn)?;
+        // L3：全程持 pool 锁，记录首列落段前的 active 游标，commit 失败回滚免段内泄漏。
+        let mut pool = self.pool.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let rollback_seg = pool.active_seg_id();
+        let rollback_off = pool.active_cursor() as u32;
+        let mut cols = Vec::with_capacity(batch.num_columns());
+        let mut appended_bytes: u64 = 0;
+        let append_result: Result<()> = (|| {
+            for i in 0..batch.num_columns() {
+                let col = batch.column(i);
+                let schema = batch.schema();
+                let field = schema.field(i);
+                let dtype = ColType::from_arrow(field.data_type()).ok_or_else(|| {
+                    StoreError::Corrupt(format!(
+                        "unsupported column type {:?} (M3: Int32/Int64/Float32/Float64/Boolean only)",
+                        field.data_type()
+                    ))
+                })?;
+                if col.null_count() != 0 {
+                    return Err(StoreError::Corrupt(format!(
+                        "column {} has nulls (M3 supports non-null only)",
+                        field.name()
+                    )));
+                }
+                let buf_bytes = primitive_buffer_bytes(field.data_type(), col.as_ref())?;
+                let loc = pool.append_aligned(&buf_bytes, dtype.byte_width())?;
+                appended_bytes += loc.len as u64;
+                cols.push(ColumnMeta {
+                    name: field.name().clone(),
+                    dtype,
+                    seg_id: loc.seg_id,
+                    offset: loc.offset,
+                    len: loc.len,
+                });
+                tracing::debug!(
+                    table_id,
+                    col = field.name(),
+                    seg_id = loc.seg_id,
+                    offset = loc.offset,
+                    len = loc.len,
+                    "column buffer appended"
+                );
+            }
+            Ok(())
+        })();
+        if let Err(e) = append_result {
+            // L3：中途 append 失败，回退到首列前游标，免半写表段内泄漏
+            tracing::warn!(table_id, err = ?e, "put_columnar append failed, rewinding");
+            let _ = pool.rewind_active_to(rollback_seg, rollback_off);
+            return Err(e);
+        }
+        // A3：配额净增校验（覆盖语义下减旧表字节）
+        let net = appended_bytes.saturating_sub(old_bytes);
+        let new_used = used.checked_add(net).ok_or(StoreError::QuotaExceeded)?;
+        if self.quota_limit > 0 && new_used > self.quota_limit {
+            tracing::warn!(
                 table_id,
-                col = field.name(),
-                seg_id = loc.seg_id,
-                offset = loc.offset,
-                len = loc.len,
-                "column buffer appended"
+                appended_bytes,
+                used,
+                limit = self.quota_limit,
+                "columnar quota exceeded, reject put_columnar"
             );
+            let _ = pool.rewind_active_to(rollback_seg, rollback_off);
+            wtxn.abort();
+            return Err(StoreError::QuotaExceeded);
         }
         let meta = TableMeta {
             row_count,
@@ -126,8 +215,19 @@ impl ColumnarStore {
         let meta_bytes = serde_json::to_vec(&meta)?;
         self.table_db
             .put(&mut wtxn, table_id.as_bytes(), &meta_bytes)?;
-        wtxn.commit()?;
-        tracing::info!(table_id, row_count, "columnar table written");
+        write_col_quota_txn(&self.quota_db, &mut wtxn, new_used)?;
+        // L3：commit 失败也回滚段字节
+        if let Err(e) = wtxn.commit() {
+            tracing::warn!(table_id, err = ?e, "put_columnar commit failed, rewinding");
+            let _ = pool.rewind_active_to(rollback_seg, rollback_off);
+            return Err(e.into());
+        }
+        tracing::info!(
+            table_id,
+            row_count,
+            appended_bytes,
+            "columnar table written"
+        );
         Ok(())
     }
 
@@ -158,7 +258,7 @@ impl ColumnarStore {
                 continue;
             }
             let handle = {
-                let mut pool = self.pool.lock().unwrap();
+                let mut pool = self.pool.lock().map_err(|_| StoreError::LockPoisoned)?;
                 pool.sealed_handle(cmeta.seg_id)?
             };
             if keepalive.is_none() {
@@ -193,6 +293,52 @@ impl ColumnarStore {
             batch, keepalive,
         )))
     }
+
+    /// 有序落盘：flush active 段 + heed force_sync（A6 close 用）
+    pub fn flush(&self) -> Result<()> {
+        let mut pool = self.pool.lock().map_err(|_| StoreError::LockPoisoned)?;
+        pool.flush()?;
+        self.env.force_sync()?;
+        tracing::info!("columnar store flushed (active segment + heed sync)");
+        Ok(())
+    }
+
+    /// 当前列式 namespace 已用字节（A3）
+    pub fn used_bytes(&self) -> Result<u64> {
+        let rtxn = self.env.read_txn()?;
+        read_col_quota_txn(&self.quota_db, &rtxn)
+    }
+
+    /// 列式配额上限（A3）
+    pub fn quota_limit(&self) -> u64 {
+        self.quota_limit
+    }
+
+    /// 实际段文件磁盘占用（P3：与 KV disk_bytes 对称）
+    pub fn disk_bytes(&self) -> Result<u64> {
+        let pool = self.pool.lock().map_err(|_| StoreError::LockPoisoned)?;
+        pool.disk_bytes()
+    }
+}
+
+// —— A3：列式配额读写，txn 参数化（与 KV 对称）——
+fn read_col_quota_txn(db: &Database<Bytes, Bytes>, txn: &RoTxn) -> Result<u64> {
+    if let Some(bytes) = db.get(txn, COL_QUOTA_KEY)? {
+        if bytes.len() == 8 {
+            let mut arr = [0u8; 8];
+            arr.copy_from_slice(bytes);
+            Ok(u64::from_le_bytes(arr))
+        } else {
+            Ok(0)
+        }
+    } else {
+        Ok(0)
+    }
+}
+
+fn write_col_quota_txn(db: &Database<Bytes, Bytes>, wtxn: &mut RwTxn, val: u64) -> Result<()> {
+    db.put(wtxn, COL_QUOTA_KEY, &val.to_le_bytes())?;
+    Ok(())
 }
 
 /// 取 primitive 列的 raw data buffer 字节（落段前）
@@ -221,13 +367,17 @@ fn primitive_buffer_bytes(dt: &DataType, arr: &dyn arrow::array::Array) -> Resul
             Ok(bytemuck_cast(a.values().as_ref()))
         }
         DataType::Boolean => {
-            // M3：Boolean 用 1 字节/值（非位压缩），取 values 转 u8 列
+            // L8：Boolean 位压缩存储（Arrow 原生布局，每 bit 1 值），
+            // 读端 new_from_packed 零拷贝重构。位压缩由 BooleanBuilder 完成。
+            use arrow::array::BooleanBuilder;
             let a = arr
                 .as_any()
                 .downcast_ref::<BooleanArray>()
                 .expect("Boolean");
-            let bytes: Vec<u8> = (0..a.len()).map(|i| a.value(i) as u8).collect();
-            Ok(bytes)
+            let mut builder = BooleanBuilder::with_capacity(a.len());
+            let bools: Vec<bool> = (0..a.len()).map(|i| a.value(i)).collect();
+            builder.append_slice(&bools);
+            Ok(builder.values_slice().to_vec())
         }
         _ => Err(StoreError::Corrupt(format!("unsupported dtype {:?}", dt))),
     }
@@ -268,9 +418,11 @@ fn build_primitive_array(
             Ok(Arc::new(Float64Array::new(sb, None)))
         }
         ColType::Boolean => {
-            // M3：Boolean 列存 u8（1/值），重构时转 BooleanArray
-            let bools: Vec<bool> = (0..row_count).map(|i| buffer[i] != 0).collect();
-            Ok(Arc::new(BooleanArray::from(bools)))
+            // L8：Boolean 位压缩零拷贝读。buffer = 位压缩 mmap 字节，
+            // new_from_packed(buf, offset=0 bit, len=row_count bits) 零拷贝重构。
+            Ok(Arc::new(BooleanArray::new_from_packed(
+                buffer, 0, row_count,
+            )))
         }
     }
 }
@@ -300,7 +452,7 @@ mod tests {
     #[test]
     fn put_get_columnar_roundtrip() {
         let dir = tempdir().unwrap();
-        let store = ColumnarStore::open(dir.path(), 0).unwrap();
+        let store = ColumnarStore::open(dir.path(), 0, 0).unwrap();
         let batch = make_batch();
         store.put_columnar("t1", &batch, None).unwrap();
         // 触发封存使 payload 进封存段（段默认 64MB，小数据不封存——直接 active 段也零拷贝可读）
@@ -323,7 +475,7 @@ mod tests {
     #[test]
     fn get_missing_returns_none() {
         let dir = tempdir().unwrap();
-        let store = ColumnarStore::open(dir.path(), 0).unwrap();
+        let store = ColumnarStore::open(dir.path(), 0, 0).unwrap();
         assert!(store
             .get_columnar_zero_copy("nope", &[], None)
             .unwrap()
@@ -334,7 +486,7 @@ mod tests {
     fn all_types_roundtrip() {
         // E4：真实 Arrow buffer 往返，覆盖全部 M3 定宽类型
         let dir = tempdir().unwrap();
-        let store = ColumnarStore::open(dir.path(), 0).unwrap();
+        let store = ColumnarStore::open(dir.path(), 0, 0).unwrap();
         let schema = Arc::new(Schema::new(vec![
             Field::new("i32", DataType::Int32, false),
             Field::new("i64", DataType::Int64, false),
@@ -382,7 +534,7 @@ mod tests {
         // 零拷贝断言：读出的列 buffer 指针落在 mmap 段区域内
         let dir = tempdir().unwrap();
         // 极小段强制封存，使 payload 进封存段（sealed_handle 返回的 Arc<MmapHandle>）
-        let store = ColumnarStore::open(dir.path(), 64).unwrap();
+        let store = ColumnarStore::open(dir.path(), 64, 0).unwrap();
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![7i64, 8, 9]))])
@@ -405,7 +557,7 @@ mod tests {
     #[test]
     fn column_projection_subset() {
         let dir = tempdir().unwrap();
-        let store = ColumnarStore::open(dir.path(), 0).unwrap();
+        let store = ColumnarStore::open(dir.path(), 0, 0).unwrap();
         let schema = Arc::new(Schema::new(vec![
             Field::new("a", DataType::Int32, false),
             Field::new("b", DataType::Float64, false),
@@ -436,7 +588,7 @@ mod tests {
     #[test]
     fn reject_null_column() {
         let dir = tempdir().unwrap();
-        let store = ColumnarStore::open(dir.path(), 0).unwrap();
+        let store = ColumnarStore::open(dir.path(), 0, 0).unwrap();
         let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int32, true)]));
         // 含 null 的数组
         let arr = Int32Array::from(vec![Some(1), None, Some(3)]);
@@ -448,11 +600,32 @@ mod tests {
     #[test]
     fn reject_unsupported_type() {
         let dir = tempdir().unwrap();
-        let store = ColumnarStore::open(dir.path(), 0).unwrap();
+        let store = ColumnarStore::open(dir.path(), 0, 0).unwrap();
         let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, false)]));
         let arr = arrow::array::StringArray::from(vec!["a", "b"]);
         let batch = RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap();
         let err = store.put_columnar("str", &batch, None).unwrap_err();
         assert!(matches!(err, StoreError::Corrupt(_)));
+    }
+
+    #[test]
+    fn quota_exceeded_rejects_put_columnar() {
+        // A3：列式配额与 KV 对称，超限拒绝写
+        let dir = tempdir().unwrap();
+        // 配额 16 字节（单 i32 列 4 行 = 16 字节）
+        let store = ColumnarStore::open(dir.path(), 0, 16).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4]))])
+                .unwrap();
+        // 首次写 16 字节，刚好达限
+        store.put_columnar("t", &batch, None).unwrap();
+        assert_eq!(store.used_bytes().unwrap(), 16);
+        // 覆盖写同表 16 字节，net=0，应通过
+        store.put_columnar("t", &batch, None).unwrap();
+        assert_eq!(store.used_bytes().unwrap(), 16);
+        // 新表再加 16 字节，超限拒绝
+        let err = store.put_columnar("t2", &batch, None).unwrap_err();
+        assert!(matches!(err, StoreError::QuotaExceeded));
     }
 }

@@ -27,6 +27,8 @@ serde_json = "1"
 bytemuck = "1"
 # 多进程写锁
 fs2 = "0.4"
+# POSIX statvfs（compact 磁盘预检 guard）
+libc = "0.2"
 # 测试
 criterion = "0.5"
 tempfile = "3"

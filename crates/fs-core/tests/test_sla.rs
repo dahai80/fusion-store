@@ -40,8 +40,8 @@ fn sla_batch_insert_meets_10k_vecs() {
     // 批量 insert_batch ≥ 10K vectors/s（dim=768）
     // PRD R1：消费方攒批后调 insert_batch 一次提交。现实批大小 100-500。
     // 验收测单批 100（PRD R1 批大小下界）一次提交吞吐 —— 对应现实调用模式。
-    // 单大批（N≥500）因 HNSW 图随批内规模增长，吞吐随 N 降（见 examples/sla_probe：
-    // n=100→16K/s, n=500→5.9K, n=1000→4K）。大批低于 10K 是 HNSW 构建固有成本，
+    // 单大批（N≥500）因 NSW 图随批内规模增长，吞吐随 N 降（见 examples/sla_probe：
+    // n=100→16K/s, n=500→5.9K, n=1000→4K）。大批低于 10K 是 NSW 构建固有成本，
     // 非缺陷；消费方按 R1 用 ~100 批即达标。此处单批 100 留 60% 余量抗并行测试争用。
     let dir = tempdir().unwrap();
     let schema = VectorSchema::new(768, MetricKind::L2);
@@ -57,7 +57,7 @@ fn sla_batch_insert_meets_10k_vecs() {
     let vps = batch_size as f64 / elapsed;
     tracing::info!(batch_size, elapsed, vps, "sla batch insert measured");
     println!("sla batch: {batch_size} vecs in {elapsed:.3}s = {vps:.0} vecs/s");
-    // 吞吐 SLA 是 release 优化指标；debug 未优化 HNSW 构建慢，断言会假阴。
+    // 吞吐 SLA 是 release 优化指标；debug 未优化 NSW 构建慢，断言会假阴。
     // debug 下只测不断言，release 下（--release / CI）严格断言（~16K/s，60% 余量）。
     #[cfg(not(debug_assertions))]
     assert!(

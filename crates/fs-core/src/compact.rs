@@ -13,8 +13,18 @@ use std::time::Duration;
 use crate::error::Result;
 use crate::vector::store::VectorIndex;
 
-/// 默认延迟回收安全期（in-flight reader 释放 Arc 的宽限）[v2 A3]
+/// 默认延迟回收安全期（建议 caller 在 compact 后等待此时长再 reclaim）[v2 A3]
+///
+/// 这是给 caller 的「建议宽限」——reclaim_segments 内部另有硬下限
+/// `MIN_RECLAIM_SAFETY`（见 vector/store.rs），段封存未过该下限且 strong_count>1
+/// 时 reclaim 会跳过保留。此默认值 > 硬下限，留足 in-flight reader 释放 Arc 的余量。
+/// E7：两个常量单一来源——此值经编译期断言锁定 ≥ MIN_RECLAIM_SAFETY，杜绝漂移。
 pub const DEFAULT_RECLAIM_SAFETY: Duration = Duration::from_secs(60);
+
+// E7：编译期保证建议宽限 ≥ 硬下限，否则 panic（drift 防护）
+// Duration 比较非 const，故比较秒数（两值均整秒）
+const _: () =
+    assert!(DEFAULT_RECLAIM_SAFETY.as_secs() >= crate::vector::store::MIN_RECLAIM_SAFETY.as_secs());
 
 /// compact 结果 —— 供 fs-serve / fs-cli 上报 + 调度延迟回收
 #[derive(Debug)]
@@ -40,9 +50,10 @@ pub fn run_compact(index: &VectorIndex) -> Result<CompactResult> {
     })
 }
 
-/// 安全期后回收旧段文件 [v2 A3]
-/// 调用方须确保已过安全期（in-flight reader 已释放），否则可能 SIGBUS。
-pub fn reclaim(index: &VectorIndex, seg_ids: &[u32]) -> Result<()> {
+/// 安全期后回收旧段文件 [v2 A3 + A5 安全期强制]
+/// A5：reclaim_segments 内部已强制安全期校验（封存超 RECLAIM_SAFETY OR strong_count==1），
+/// 不安全的段会被跳过保留，返回已回收段数。caller 可对未回收段稍后重试。
+pub fn reclaim(index: &VectorIndex, seg_ids: &[u32]) -> Result<usize> {
     index.reclaim_segments(seg_ids)
 }
 
@@ -147,8 +158,13 @@ mod tests {
         assert!(data_dir.join("vec_payload_0000.mmap").exists());
         let res = run_compact(&idx).unwrap();
         assert!(!res.reclaimable_segs.is_empty());
-        // reclaim 删旧段文件（安全期假定已过，测试无 in-flight reader）
-        reclaim(&idx, &res.reclaimable_segs).unwrap();
+        // reclaim 删旧段文件（A5：无 in-flight reader → strong_count==1 → 安全删除）
+        let n = reclaim(&idx, &res.reclaimable_segs).unwrap();
+        assert_eq!(
+            n,
+            res.reclaimable_segs.len(),
+            "all old segs reclaimed (no reader)"
+        );
         // 旧段文件不存在（COW 后旧段物理删除）
         for sid in &res.reclaimable_segs {
             let p = data_dir.join(format!("vec_payload_{:04}.mmap", sid));
@@ -156,6 +172,23 @@ mod tests {
         }
         // 新段文件仍存在（活向量所在），KNN 仍可用
         assert!(idx.search_knn(&[0.0, 0.0, 0.0, 0.0], 1, None).is_ok());
+    }
+
+    #[test]
+    fn reclaim_idempotent_on_deleted_segs() {
+        // A5：已删段二次 reclaim 返回 0（幂等，不报错）
+        let dir = tempdir().unwrap();
+        let idx = make_index(dir.path(), 4);
+        for i in 0..5u64 {
+            let v = vec![i as f32, 0.0, 0.0, 0.0];
+            idx.insert(i, &v, None).unwrap();
+        }
+        let res = run_compact(&idx).unwrap();
+        assert!(!res.reclaimable_segs.is_empty());
+        let n = reclaim(&idx, &res.reclaimable_segs).unwrap();
+        assert_eq!(n, res.reclaimable_segs.len(), "first reclaim deletes all");
+        let n2 = reclaim(&idx, &res.reclaimable_segs).unwrap();
+        assert_eq!(n2, 0, "second reclaim idempotent (segs gone)");
     }
 
     #[test]

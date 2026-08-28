@@ -24,12 +24,12 @@ impl ColType {
         }
     }
 
-    /// 单元素字节宽（Boolean 按位但 buffer 存 u8 bitmap，M3 全 non-null 一字节/值占位）
+    /// 单元素字节宽（L8：Boolean 位压缩，按位存储；append_aligned 用 1 = 无对齐填充）
     pub fn byte_width(&self) -> usize {
         match self {
             ColType::Int32 | ColType::Float32 => 4,
             ColType::Int64 | ColType::Float64 => 8,
-            // Boolean：M3 用 1 字节/值简化（非位压缩），避免 bitmap 偏移复杂度
+            // Boolean：位压缩（每 bit 1 值），字节缓冲对齐 1，无需 padding
             ColType::Boolean => 1,
         }
     }

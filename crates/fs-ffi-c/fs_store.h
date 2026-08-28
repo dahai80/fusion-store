@@ -63,10 +63,23 @@ int fs_store_insert_vector(FsStoreHandle* h, uint64_t id, const float* v, size_t
 int fs_store_search_knn(FsStoreHandle* h, const float* q, size_t qlen, size_t top_k,
                         uint64_t* out_ids, float* out_dists, size_t* out_n);
 
+// 删除向量（软删 tombstone，向量字节由 compact COW 回收）。
+// 返回 FS_OK=删了存活向量，FS_ERR_NOT_FOUND=id 不存在或已删。
+int fs_store_delete_vector(FsStoreHandle* h, uint64_t id);
+
+// 按 id 取单向量（强制拷贝，E3）。id 不存在/已软删 → FS_ERR_NOT_FOUND。
+// out_cap 不足返 FS_ERR_OTHER，vlen_out 写所需长度（=dim 个 f32）。
+int fs_store_get_vector(FsStoreHandle* h, uint64_t id,
+                        float* out_val, size_t out_cap, size_t* vlen_out);
+
+// 枚举存活（非软删）向量 id（强制拷贝，E3）。out_ids 预分配容量 >= cap。
+// 容量不足返 FS_ERR_OTHER，out_n 写所需总数（两段式：先 cap=0 探总数再分配）。
+int fs_store_list_vector_ids(FsStoreHandle* h, uint64_t* out_ids, size_t cap, size_t* out_n);
+
 // 返回向量维度（0 = 出错或空）。
 size_t fs_store_vector_dim(const FsStoreHandle* h);
 
-// checkpoint：HNSW 图 snapshot 落盘 + 段 flush（close 前调，重开可恢复图）。
+// checkpoint：NSW 图 snapshot 落盘 + 段 flush（close 前调，重开可恢复图）。
 int fs_store_checkpoint(FsStoreHandle* h);
 
 #ifdef __cplusplus

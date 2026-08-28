@@ -115,6 +115,46 @@ def test_non_contiguous_or_wrong_dtype_rejected():
     shutil.rmtree(d, ignore_errors=True)
 
 
+def test_delete_vector_get_vector_list_vector_ids():
+    # #2 delete_vector + #3 get_vector/list_vector_ids 端到端
+    d = _new_dir()
+    s = fusion_store.Store.open(d, dim=4)
+    for i in range(5):
+        v = np.zeros(4, dtype=np.float32)
+        v[0] = float(i)
+        s.insert_vector(i, v)
+
+    # list 应 5 个
+    ids = s.list_vector_ids()
+    assert sorted(ids) == [0, 1, 2, 3, 4], f"list before delete: {ids}"
+
+    # get id=2 应成功，值 == 插入
+    got = s.get_vector(2)
+    assert got is not None
+    assert [float(x) for x in got] == [2.0, 0.0, 0.0, 0.0], f"get_vector(2): {got}"
+    # get missing -> None
+    assert s.get_vector(99) is None
+
+    # delete id=2 -> True
+    assert s.delete_vector(2) is True
+    # 再删 id=2 -> False（已软删）
+    assert s.delete_vector(2) is False
+    # 删 missing id=99 -> False
+    assert s.delete_vector(99) is False
+
+    # get id=2 删后 -> None
+    assert s.get_vector(2) is None
+    # list 排除 id=2，剩 4 个
+    ids2 = s.list_vector_ids()
+    assert sorted(ids2) == [0, 1, 3, 4], f"list after delete: {ids2}"
+
+    # E3：get_vector 返回 owned list，非 mmap view——del s 后仍可读
+    captured = [float(x) for x in s.get_vector(0)]
+    del s
+    assert captured == [0.0, 0.0, 0.0, 0.0]
+    shutil.rmtree(d, ignore_errors=True)
+
+
 if __name__ == "__main__":
     import traceback
 

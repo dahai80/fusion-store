@@ -12,64 +12,60 @@
 //!   store.insert_vector(id: int, vec: np.ndarray)     # numpy 入参零拷贝
 //!   store.search_knn(query: np.ndarray, top_k: int, timeout_ms: int|None) -> (ids, dists)
 //!                                                      # 出参 numpy 强制拷贝（E3）
+//!   store.delete_vector(id: int) -> bool              # 软删，True=删了存活向量（#2）
+//!   store.get_vector(id: int) -> list[float] | None   # 强制拷贝，missing/已软删→None（#3）
+//!   store.list_vector_ids() -> list[int]              # 存活（非软删）id（#3）
 //!   store.checkpoint()
 //!   store.vector_dim() -> int
 
 use std::path::PathBuf;
 
-use fs_core::store::KvStore;
 use fs_core::vector::schema::{MetricKind, VectorSchema};
-use fs_core::vector::store::VectorIndex;
+use fs_core::{Engine, FusionStoreEngine};
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyList, PyTuple};
 
-/// Python 句柄 —— 持向量索引 + KV store
+/// Python 句柄 —— 持 Engine（聚合 KV+向量+列式+WAL，F1/A2）
 #[pyclass(name = "Store")]
 pub struct PyStore {
-    vec: VectorIndex,
-    kv: KvStore,
+    engine: Engine,
 }
 
 #[pymethods]
 impl PyStore {
     /// Store.open(path, dim=None)
     /// dim=Some → create（锁 schema dim，建向量索引）；dim=None → reopen（从持久化 schema 恢复）
+    /// 经 Engine::open 自动 recover（A1）+ WAL 接入写路径（F2）
     #[staticmethod]
     #[pyo3(signature = (path, dim=None))]
     fn open(path: &str, dim: Option<usize>) -> PyResult<Self> {
         let base = PathBuf::from(expand_tilde(path));
-        let vec_dir = base.join("vec");
-        let kv_dir = base.join("kv");
-        std::fs::create_dir_all(&vec_dir).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        std::fs::create_dir_all(&kv_dir).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let vec_idx = match dim {
-            Some(d) => {
-                tracing::info!(path = %vec_dir.display(), dim = d, "py open(create)");
-                let schema = VectorSchema::new(d, MetricKind::L2);
-                VectorIndex::open(&vec_dir, schema, 0)
-            }
-            None => {
-                tracing::info!(path = %vec_dir.display(), "py open(reopen)");
-                VectorIndex::reopen(&vec_dir, 0)
-            }
+        let schema = dim.map(|d| VectorSchema::new(d, MetricKind::L2));
+        if let Some(d) = dim {
+            tracing::info!(path = %base.display(), d, "py open(create)");
+        } else {
+            tracing::info!(path = %base.display(), "py open(reopen)");
         }
-        .map_err(map_err_map)?;
-        let kv = KvStore::open(&kv_dir, 0, 0).map_err(map_err_map)?;
-        Ok(PyStore { vec: vec_idx, kv })
+        let engine = Engine::open(&base, schema, 0).map_err(map_err_map)?;
+        Ok(PyStore { engine })
     }
 
-    /// 写 KV。key/value 为 bytes。
+    /// 写 KV。经 Engine → WAL（fsync）→ mmap 段（F2）。
     fn put_kv(&self, key: &[u8], value: &[u8]) -> PyResult<()> {
-        self.kv.put_kv(key, value, None).map_err(map_err_map)?;
+        self.engine.put_kv(key, value, None).map_err(map_err_map)?;
         Ok(())
     }
 
     /// 读 KV（强制拷贝，E3）→ 返回 owned bytes 或 None。
     /// 不暴露 mmap 指针 view：返回的 PyBytes 是拷贝，Python GC 释放无悬垂。
     fn get_kv<'py>(&self, py: Python<'py>, key: &[u8]) -> PyResult<Bound<'py, PyAny>> {
-        match self.kv.get_kv_zero_copy(key, None).map_err(map_err_map)? {
+        match self
+            .engine
+            .get_kv_zero_copy(key, None)
+            .map_err(map_err_map)?
+        {
             Some(buf) => {
                 let bytes = buf.as_bytes();
                 // 强制拷贝到 PyBytes（E3）：buf.as_bytes() 落 mmap 区，拷出 owned
@@ -82,19 +78,20 @@ impl PyStore {
     }
 
     /// 插入向量（numpy 入参零拷贝读 buffer，E3 入参方向）。
-    /// vec: numpy.ndarray float32 连续。Rust 经 PyBuffer 直接读 buffer 指针，无 Python 序列化。
+    /// 经 Engine → WAL（payload 完整 vector）→ 落段连边（F2）。
     fn insert_vector(&self, py: Python<'_>, id: u64, vec: PyBuffer<f32>) -> PyResult<()> {
         let buf = vec.as_slice(py).ok_or_else(|| {
             PyRuntimeError::new_err("vec must be C-contiguous float32 numpy array")
         })?;
         let v: Vec<f32> = buf.iter().map(|c| c.get()).collect();
-        self.vec.insert(id, &v, None).map_err(map_err_map)?;
+        self.engine
+            .insert_vector(id, &v, None)
+            .map_err(map_err_map)?;
         Ok(())
     }
 
     /// KNN 检索（出参强制拷贝，E3）。
-    /// query: numpy.ndarray float32 连续；返回 (ids, dists) 为 owned Python tuple of list。
-    /// ids/dists 是拷贝后的 owned 数据，非 mmap view —— 校验无 view 暴露。
+    /// 经 Engine → 向量索引零拷贝读。返回 (ids, dists) 为 owned Python tuple of list。
     #[pyo3(signature = (query, top_k, timeout_ms=None))]
     fn search_knn<'py>(
         &self,
@@ -109,7 +106,7 @@ impl PyStore {
         let q: Vec<f32> = qbuf.iter().map(|c| c.get()).collect();
         let timeout = timeout_ms.map(std::time::Duration::from_millis);
         let results = self
-            .vec
+            .engine
             .search_knn(&q, top_k, timeout)
             .map_err(map_err_map)?;
         // 出参强制拷贝（E3）：建 owned list，非 mmap view
@@ -121,20 +118,55 @@ impl PyStore {
         Ok(tup.into_any())
     }
 
-    /// checkpoint：HNSW 图 snapshot 落盘（H1）。close 前调，重开方可恢复图。
+    /// checkpoint：图 snapshot + KV flush + WAL marker 推进 applied_seq + 截断 WAL（L6）。
     fn checkpoint(&self) -> PyResult<()> {
-        self.vec.checkpoint().map_err(map_err_map)?;
+        self.engine.checkpoint().map_err(map_err_map)?;
         Ok(())
     }
 
     /// 返回向量维度（供 caller 校验 buffer 大小）。
     fn vector_dim(&self) -> usize {
-        self.vec.schema().dim
+        match self.engine.vec_index() {
+            Ok(g) => g.as_ref().unwrap().schema().dim,
+            Err(_) => 0,
+        }
     }
 
     /// 返回当前向量数。
     fn vector_count(&self) -> usize {
-        self.vec.len()
+        match self.engine.vec_index() {
+            Ok(g) => g.as_ref().unwrap().len(),
+            Err(_) => 0,
+        }
+    }
+
+    /// 删除向量（软删 tombstone，向量字节由 compact COW 回收）。返回 True=删了存活向量，
+    /// False=id 不存在或已删（#2）。
+    fn delete_vector(&self, id: u64) -> PyResult<bool> {
+        let deleted = self.engine.delete_vector(id, None).map_err(map_err_map)?;
+        tracing::info!(id, deleted, "py delete_vector");
+        Ok(deleted)
+    }
+
+    /// 按 id 取单向量（强制拷贝，E3）→ 返回 list[float] 或 None（#3）。
+    /// id 不存在或已软删 → None。owned list 非 mmap view。
+    fn get_vector<'py>(&self, py: Python<'py>, id: u64) -> PyResult<Bound<'py, PyAny>> {
+        match self.engine.get_vector(id, None).map_err(map_err_map)? {
+            Some(v) => {
+                // 强制拷贝到 owned Python list（E3）：非 mmap view
+                tracing::debug!(id, len = v.len(), "py get_vector forced-copy");
+                let list = PyList::new(py, v)?;
+                Ok(list.into_any())
+            }
+            None => Ok(py.None().into_bound(py)),
+        }
+    }
+
+    /// 枚举存活（非软删）向量 id → owned list[int]（#3，E3 强制拷贝）。
+    fn list_vector_ids(&self) -> PyResult<Vec<u64>> {
+        let ids = self.engine.list_vector_ids(None).map_err(map_err_map)?;
+        tracing::debug!(count = ids.len(), "py list_vector_ids");
+        Ok(ids)
     }
 }
 

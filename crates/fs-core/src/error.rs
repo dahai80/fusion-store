@@ -39,8 +39,21 @@ pub enum StoreError {
     #[error("corrupt: {0}")]
     Corrupt(String),
 
+    // E8：heed/LMDB map_size 写满（MapFull）。caller 据此决定扩 map_size 或告警，
+    // 非 panic。当前 map_size=2GB（KV locator 12B/项 ≈ 1.8 亿 key），企业级容量预警。
+    #[error("heed map full: metadata exceeded map_size ({current} bytes, limit {limit})")]
+    MapFull { current: u64, limit: u64 },
+
     #[error("operation timed out")]
     Timeout,
+
+    // F3：payload/offset 超 u32::MAX 拒绝，免静默截断损坏
+    #[error("value too large: {0} bytes exceeds u32 max")]
+    ValueTooLarge(usize),
+
+    // L5：锁中毒（写侧持锁 panic）显式报错，不 unwrap panic 扩散
+    #[error("lock poisoned: writer panicked while holding lock")]
+    LockPoisoned,
 
     #[cfg(feature = "columnar")]
     #[error("arrow error: {0}")]

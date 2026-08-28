@@ -13,14 +13,14 @@ Zero-copy storage & indexing engine — the **infrastructure-layer** persistence
 Unifies three storage primitives over macOS mmap + Apple Silicon unified memory, eliminating inter-process serialization:
 
 - **KV state** — `mmap` + LMDB, crash-safe reads
-- **Vector index** — HNSW (Rust-native), incremental insert, SIMD distance
+- **Vector index** — 单层 NSW (Rust-native, 非 HNSW — A2 诚实命名), incremental insert, SIMD distance
 - **Columnar data** — Apache Arrow, memory layout aligned with fusion-mlx Tensor buffers
 
 Written in **Rust** for C-ABI-compatible memory layout (FFI to Swift/Python consumers).
 
 ## Business Boundary (from PRD)
 
-In-scope: mmap block alloc/read-write, incremental HNSW vector index + persistence, multi-process concurrency locks + crash recovery.
+In-scope: mmap block alloc/read-write, incremental NSW vector index + persistence, multi-process concurrency locks + crash recovery.
 
 Out-of-scope: context selection / semantic association (that's `fusion-memory`), business SQL query optimization (keep storage primitives minimal).
 
@@ -77,7 +77,7 @@ No commands are runnable yet — create `Cargo.toml` first (see "Bootstrapping" 
 
 Single crate for the engine (the PRD treats KV/vector/columnar as one engine, not a workspace). If it grows, split into a workspace mirroring `fusion-design`'s leaf-first dependency graph.
 
-Likely modules: `mmap` (block alloc, `ZeroCopyBuffer`), `kv` (LMDB-backed `put_kv`/`get_kv_zero_copy`), `vector` (HNSW `insert_vector`/`search_knn`), `columnar` (Arrow), `lock` (multi-process concurrency + crash recovery).
+Likely modules: `mmap` (block alloc, `ZeroCopyBuffer`), `kv` (LMDB-backed `put_kv`/`get_kv_zero_copy`), `vector` (NSW `insert_vector`/`search_knn`), `columnar` (Arrow), `lock` (multi-process concurrency + crash recovery).
 
 ## Bootstrapping (first implementation task)
 

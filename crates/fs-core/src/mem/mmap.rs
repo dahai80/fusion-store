@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use memmap2::{Mmap, MmapMut};
 
-use crate::error::Result;
+use crate::error::{Result, StoreError};
 
 /// mmap 段句柄 —— sealed=true 后只读、永不改大小 [v2 H4]
 ///
@@ -52,13 +52,15 @@ impl MmapHandle {
 
     /// 打开读写映射（当前写段，单写者独占）
     pub fn open_write(file: File) -> Result<Self> {
-        let mmap = unsafe { MmapMut::map_mut(&file)? };
-        tracing::debug!(len = mmap.len(), "mmap write segment opened");
-        // MmapMut 与 Mmap 不同类型，这里先存只读快照；写路径在 allocator 单独持 MmapMut
-        // M0 阶段仅提供只读表面，写段实现在 M1 allocator
+        let mmap_mut = unsafe { MmapMut::map_mut(&file)? };
+        tracing::debug!(len = mmap_mut.len(), "mmap write segment opened");
+        // F7：旧实现 transmute MmapMut→Mmap 是 UB（两类型布局无保证）。
+        // memmap2 0.9 make_read_only 消费 MmapMut 转 Mmap，安全且语义对（写路径在
+        // segment.rs 单独持 MmapMut 写活跃段，此处仅开只读快照供读侧）。
+        let mmap = mmap_mut.make_read_only()?;
         Ok(Self {
             file,
-            mmap: unsafe { std::mem::transmute::<MmapMut, Mmap>(mmap) },
+            mmap,
             base: 0,
             sealed: false,
         })
@@ -116,15 +118,38 @@ unsafe impl Send for ZeroCopyVec {}
 unsafe impl Sync for ZeroCopyVec {}
 
 impl ZeroCopyVec {
-    pub fn new(mmap_handle: Arc<MmapHandle>, offset: usize, len: usize) -> Self {
-        let base = mmap_handle.as_bytes().as_ptr();
+    // F6：bounds 校验免越界。返回 Result，offset+len 超 mmap 长度 → Corrupt。
+    pub fn new(mmap_handle: Arc<MmapHandle>, offset: usize, len: usize) -> Result<Self> {
+        let region_len = mmap_handle.len();
         // offset 对齐 f32（段 append 按 byte_len=dim*4 对齐，offset 始终 4 倍数）
+        let byte_len = len
+            .checked_mul(4)
+            .ok_or_else(|| StoreError::Corrupt(format!("vector len {} overflow byte size", len)))?;
+        let end = offset.checked_add(byte_len).ok_or_else(|| {
+            StoreError::Corrupt(format!(
+                "vec region offset {} + {} overflow usize",
+                offset, byte_len
+            ))
+        })?;
+        if end > region_len {
+            tracing::error!(
+                offset,
+                byte_len,
+                region_len,
+                "zero-copy vec out of mmap bounds"
+            );
+            return Err(StoreError::Corrupt(format!(
+                "zero-copy vec [{}..{}] out of mmap region len {}",
+                offset, end, region_len
+            )));
+        }
+        let base = mmap_handle.as_bytes().as_ptr();
         let ptr = unsafe { base.add(offset) as *const f32 };
-        Self {
+        Ok(Self {
             ptr,
             len,
             mmap_handle,
-        }
+        })
     }
 
     /// 零拷贝读 f32 切片 —— SIMD 距离直接用，无 Vec 分配
@@ -145,15 +170,34 @@ unsafe impl Send for ZeroCopyBuffer {}
 unsafe impl Sync for ZeroCopyBuffer {}
 
 impl ZeroCopyBuffer {
-    pub fn new(mmap_handle: Arc<MmapHandle>, offset: usize, len: usize) -> Self {
+    // F6：bounds 校验免越界。返回 Result，offset+len 超 mmap 长度 → Corrupt。
+    pub fn new(mmap_handle: Arc<MmapHandle>, offset: usize, len: usize) -> Result<Self> {
+        let region_len = mmap_handle.len();
+        let end = offset.checked_add(len).ok_or_else(|| {
+            StoreError::Corrupt(format!(
+                "buffer region offset {} + {} overflow usize",
+                offset, len
+            ))
+        })?;
+        if end > region_len {
+            tracing::error!(
+                offset,
+                len,
+                region_len,
+                "zero-copy buffer out of mmap bounds"
+            );
+            return Err(StoreError::Corrupt(format!(
+                "zero-copy buffer [{}..{}] out of mmap region len {}",
+                offset, end, region_len
+            )));
+        }
         let base = mmap_handle.as_bytes().as_ptr();
-        // offset 在段范围内，构造时校验
         let ptr = unsafe { base.add(offset) };
-        Self {
+        Ok(Self {
             ptr,
             len,
             mmap_handle,
-        }
+        })
     }
 
     /// 零拷贝读字节切片
@@ -186,7 +230,7 @@ mod tests {
         let payload = b"hello-fusion-store-zero-copy";
         std::io::Write::write_all(&mut tmp, payload).unwrap();
         let handle = Arc::new(MmapHandle::open_read(tmp.into_file()).unwrap());
-        let buf = ZeroCopyBuffer::new(handle.clone(), 0, payload.len());
+        let buf = ZeroCopyBuffer::new(handle.clone(), 0, payload.len()).unwrap();
         assert_eq!(buf.as_bytes(), payload);
         assert!(!buf.is_empty());
         assert_eq!(buf.len(), payload.len());

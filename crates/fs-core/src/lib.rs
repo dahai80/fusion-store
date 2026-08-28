@@ -7,6 +7,7 @@
 pub mod columnar;
 pub mod compact;
 pub mod engine;
+pub mod engine_impl;
 pub mod error;
 pub mod mem;
 pub mod store;
@@ -14,6 +15,7 @@ pub mod vector;
 
 pub use compact::{reclaim, run_compact, CompactResult};
 pub use engine::FusionStoreEngine;
+pub use engine_impl::Engine;
 pub use error::{Result, StoreError};
 pub use mem::mmap::{MmapHandle, ZeroCopyBuffer};
 pub use store::KvStore;

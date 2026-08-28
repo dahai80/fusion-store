@@ -7,6 +7,6 @@ pub mod recover;
 pub mod segment;
 pub mod wal;
 
-pub use recover::{build_recover_plan, finalize_recover, RecoverPlan, RegisteredBlocks};
+pub use recover::{build_recover_plan, finalize_recover, RecoverPlan};
 pub use segment::{SegmentPool, ValueLocator};
 pub use wal::{CheckpointMarker, Wal, WalEntry, WalOp};

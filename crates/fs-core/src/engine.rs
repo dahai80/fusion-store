@@ -60,6 +60,11 @@ pub trait FusionStoreEngine {
     ) -> Result<Vec<(u64, f32)>>;
     fn delete_vector(&self, id: u64, timeout: Option<Duration>) -> Result<bool>;
 
+    // —— 向量读取/枚举（消费方 retrieve_context 兜底 + reconcile 审计，#3）——
+    // id 不存在或已软删 → None；list 排除软删
+    fn get_vector(&self, id: u64, timeout: Option<Duration>) -> Result<Option<Vec<f32>>>;
+    fn list_vector_ids(&self, timeout: Option<Duration>) -> Result<Vec<u64>>;
+
     // —— 列式原语（通用 Arrow，不涉 MLX）[v2 H3] ——
     #[cfg(feature = "columnar")]
     fn put_columnar(
@@ -79,4 +84,6 @@ pub trait FusionStoreEngine {
     // —— 生命周期 ——
     fn checkpoint(&self) -> Result<()>;
     fn recover(&self) -> Result<()>;
+    // A6：有序关闭——flush active 段 + heed sync + WAL 最终 marker，免正常退出丢数据
+    fn close(&self) -> Result<()>;
 }

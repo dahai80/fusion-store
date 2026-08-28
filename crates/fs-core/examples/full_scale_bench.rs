@@ -86,9 +86,9 @@ fn main() {
             .collect();
         brute.sort_by(|a, b| a.1.total_cmp(&b.1));
         let brute_top: Vec<u64> = brute.iter().take(top_k).map(|(id, _)| *id).collect();
-        let hnsw = idx.search_knn(query, top_k, None).unwrap();
-        let hnsw_top: Vec<u64> = hnsw.iter().map(|(id, _)| *id).collect();
-        let overlap = hnsw_top.iter().filter(|id| brute_top.contains(id)).count();
+        let nsw = idx.search_knn(query, top_k, None).unwrap();
+        let nsw_top: Vec<u64> = nsw.iter().map(|(id, _)| *id).collect();
+        let overlap = nsw_top.iter().filter(|id| brute_top.contains(id)).count();
         recalls.push(overlap as f32 / top_k as f32);
     }
     let avg_recall = recalls.iter().sum::<f32>() / recalls.len() as f32;
@@ -125,9 +125,9 @@ fn main() {
     );
 
     // 验收门禁（PRD §2.5）：召回 ≥ 0.95、p99 < 5ms —— 全规模（N≥1M）指标。
-    // HNSW 召回随 N 增（图更连通）；小规模 N 召回自然偏低（2000×128 ~0.92 正常）。
+    // NSW 召回随 N 增（图更连通）；小规模 N 召回自然偏低（2000×128 ~0.92 正常）。
     // 故门禁按 N 分档：N≥100K 严格 0.95；N<100K 放宽 0.90（验趋势，非全规模达标）。
-    // 全规模达标需 release + 充足 RAM；debug 下 HNSW 未优化，门禁跳过（仅打印）。
+    // 全规模达标需 release + 充足 RAM；debug 下 NSW 未优化，门禁跳过（仅打印）。
     let recall_gate = if n >= 100_000 { 0.95 } else { 0.90 };
     let mut ok = true;
     if cfg!(not(debug_assertions)) {

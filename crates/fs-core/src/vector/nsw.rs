@@ -1,8 +1,12 @@
-//! HNSW 图常驻 RAM —— 单层 NSW 先跑通 [v2 H1/R5]
+//! NSW 图常驻 RAM —— 单层邻接图（A2 诚实命名，非 HNSW）[v2 H1/R5]
+//!
+//! 本实现是**单层 NSW**（Navigable Small World 邻接图），无多层跳表结构。
+//! 检索复杂度近似 O(N^log M)，非真 HNSW 的 O(log N)。N 持续增长会线性劣化
+//! 检索延迟，p99<5ms SLA 有扩展上限（README 全规模基准节）。
 //!
 //! 图结构整体常驻内存（非逐节点入 heed，H1 根治）。
 //! 检索全程内存指针跳转，零磁盘 IO。
-//! M=16, ef_construction=200, ef_search=50 固定参数（PRD 风险对策：先固定后调参）。
+//! M=16, ef_construction=200, ef_search=200 固定参数（PRD 风险对策：先固定后调参）。
 //! 软删除：节点标 deleted=true，KNN 跳过；物理清理在 M4 compact。
 //! 持久化：snapshot 落单 mmap 段（snapshot.rs，M2 后续）。
 //!
@@ -11,7 +15,7 @@
 
 use std::collections::{BinaryHeap, HashMap};
 
-/// HNSW 固定参数（PRD M2 风险对策：先固定后调参）
+/// NSW 固定参数（PRD M2 风险对策：先固定后调参）
 pub const M: usize = 16;
 pub const EF_CONSTRUCTION: usize = 200;
 // ef_search 提至 200：单层 NSW 无多层捷径，ef=50 召回卡 0.925 不达 PRD §2.5 ≥0.95。
@@ -38,21 +42,21 @@ impl Node {
     }
 }
 
-/// HNSW 单层图（常驻 RAM，纯拓扑）
+/// NSW 单层图（常驻 RAM，纯拓扑）
 ///
 /// 节点 id→邻居链表 + 软删除标记。向量数据与距离由 caller 注入。
-pub struct HnswGraph {
+pub struct NswGraph {
     nodes: HashMap<NodeId, Node>,
     entry_point: Option<NodeId>,
 }
 
-impl HnswGraph {
+impl NswGraph {
     pub fn new() -> Self {
         tracing::info!(
             M,
             EF_CONSTRUCTION,
             EF_SEARCH,
-            "hnsw graph created (single-layer NSW)"
+            "nsw graph created (single-layer NSW)"
         );
         Self {
             nodes: HashMap::new(),
@@ -108,12 +112,12 @@ impl HnswGraph {
         if self.entry_point.is_none() {
             self.entry_point = Some(id);
             self.nodes.insert(id, node);
-            tracing::debug!(id, "hnsw insert first node (entry point)");
+            tracing::debug!(id, "nsw insert first node (entry point)");
             return Ok(());
         }
         let entry = self.entry_point.unwrap();
-        // 搜 ef_construction 近邻候选
-        let candidates = self.search_layer(dist, EF_CONSTRUCTION, entry);
+        // 搜 ef_construction 近邻候选（insert 无 deadline，构建不走超时）
+        let candidates = self.search_layer(dist, EF_CONSTRUCTION, entry, None);
         // 取前 M 个连边
         let neighbors: Vec<NodeId> = candidates.into_iter().take(M).map(|(nid, _)| nid).collect();
         node.neighbors = neighbors.clone();
@@ -127,17 +131,19 @@ impl HnswGraph {
             }
         }
         self.nodes.insert(id, node);
-        tracing::debug!(id, neighbors = neighbors.len(), "hnsw insert node");
+        tracing::debug!(id, neighbors = neighbors.len(), "nsw insert node");
         Ok(())
     }
 
     /// 层内贪心搜索 —— 返回 (id, distance) 升序，跳过 deleted。
     /// query_dist: 查询向量到任意节点 id 的距离闭包。
+    /// deadline: 超时则提前终止遍历返回已遍历子集（R5：遍历中途检查，非事后）。
     fn search_layer(
         &self,
         query_dist: &dyn Fn(NodeId) -> f32,
         ef: usize,
         entry: NodeId,
+        deadline: Option<std::time::Instant>,
     ) -> Vec<(NodeId, f32)> {
         // 候选堆（小顶，按距离）+ 结果堆（大顶，保 ef 个最近）
         let mut visited: HashMap<NodeId, ()> = HashMap::new();
@@ -151,7 +157,22 @@ impl HnswGraph {
             results.push((OrderDist(d0), entry));
         }
 
+        // R5：超时检查节流——每 256 次弹出查一次 deadline，免每跳 Instant::now 开销
+        let mut pop_count: u32 = 0;
         while let Some((std::cmp::Reverse(OrderDist(cd)), cid)) = candidates.pop() {
+            pop_count = pop_count.wrapping_add(1);
+            if pop_count & 0xFF == 0 {
+                if let Some(dl) = deadline {
+                    if std::time::Instant::now() > dl {
+                        tracing::warn!(
+                            ef,
+                            pop_count,
+                            "search_layer timeout mid-traversal, returning partial"
+                        );
+                        break;
+                    }
+                }
+            }
             // 结果集已满且当前候选比最远结果还远 → 停
             if results.len() >= ef {
                 if let Some((OrderDist(farthest), _)) = results.peek() {
@@ -211,11 +232,11 @@ impl HnswGraph {
             None => return Ok(vec![]),
         };
         let ef = EF_SEARCH.max(top_k);
-        let mut found = self.search_layer(query_dist, ef, entry);
-        // timeout 检查（A1）—— 单层搜索快，超时罕见；截断到 top_k
+        let mut found = self.search_layer(query_dist, ef, entry, deadline);
+        // R5：遍历中已按 deadline 提前终止（每 256 跳查一次）；此处收尾再查一次兜底
         if let Some(dl) = deadline {
             if std::time::Instant::now() > dl {
-                tracing::warn!(top_k, "knn timeout, returning partial");
+                tracing::warn!(top_k, "knn exceeded deadline, returning partial best");
             }
         }
         found.truncate(top_k);
@@ -227,7 +248,7 @@ impl HnswGraph {
         if let Some(node) = self.nodes.get_mut(&id) {
             let was = !node.deleted;
             node.deleted = true;
-            tracing::debug!(id, "hnsw soft-delete node");
+            tracing::debug!(id, "nsw soft-delete node");
             was
         } else {
             false
@@ -239,6 +260,14 @@ impl HnswGraph {
         self.nodes
             .iter()
             .map(|(id, n)| (*id, n.neighbors.clone()))
+            .collect()
+    }
+
+    /// 快照所有节点含软删标记（L7：snapshot 持久化 deleted 状态用）
+    pub fn snapshot_nodes_with_deleted(&self) -> Vec<(NodeId, Vec<NodeId>, bool)> {
+        self.nodes
+            .iter()
+            .map(|(id, n)| (*id, n.neighbors.clone(), n.deleted))
             .collect()
     }
 
@@ -258,9 +287,43 @@ impl HnswGraph {
             self.entry_point = Some(id);
         }
     }
+
+    // E4：图结构完整性校验 —— snapshot 重载后调用。
+    // 1) 每条边的邻居 id 必须在节点集合内（无悬空边，否则检索跳到不存在的节点）
+    // 2) 非空图的入口点必须存在且未软删（否则 KNN 无起点）
+    // 任一失败 → Err(Corrupt)，caller 据此重建图而非加载坏图。
+    pub fn validate_edges(&self) -> crate::Result<()> {
+        for (id, node) in &self.nodes {
+            for &nb in &node.neighbors {
+                if !self.nodes.contains_key(&nb) {
+                    return Err(crate::StoreError::Corrupt(format!(
+                        "dangling edge: node {} -> {} (target not in graph)",
+                        id, nb
+                    )));
+                }
+            }
+        }
+        if !self.nodes.is_empty() {
+            match self.entry_point {
+                Some(ep) if !self.is_deleted(ep) => {}
+                Some(ep) => {
+                    return Err(crate::StoreError::Corrupt(format!(
+                        "entry point {} is soft-deleted, no valid search start",
+                        ep
+                    )));
+                }
+                None => {
+                    return Err(crate::StoreError::Corrupt(
+                        "non-empty graph has no entry point".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
-impl Default for HnswGraph {
+impl Default for NswGraph {
     fn default() -> Self {
         Self::new()
     }
@@ -309,7 +372,7 @@ mod tests {
     fn insert_first_sets_entry_point() {
         let mut v = HashMap::new();
         v.insert(1u64, vec![1.0f32; 8]);
-        let mut g = HnswGraph::new();
+        let mut g = NswGraph::new();
         let df = dist_fn(&v, &v[&1], MetricKind::L2);
         g.insert(1, &df).unwrap();
         assert_eq!(g.len(), 1);
@@ -319,7 +382,7 @@ mod tests {
     fn insert_duplicate_rejects() {
         let mut v = HashMap::new();
         v.insert(1, vec![1.0f32; 8]);
-        let mut g = HnswGraph::new();
+        let mut g = NswGraph::new();
         let df = dist_fn(&v, &v[&1], MetricKind::L2);
         g.insert(1, &df).unwrap();
         let err = g.insert(1, &df).unwrap_err();
@@ -335,7 +398,7 @@ mod tests {
             vec[0] = i as f32;
             v.insert(i, vec);
         }
-        let mut g = HnswGraph::new();
+        let mut g = NswGraph::new();
         for i in 0..10u64 {
             let df = dist_fn(&v, &v[&i], MetricKind::L2);
             g.insert(i, &df).unwrap();
@@ -357,7 +420,7 @@ mod tests {
             vec[0] = i as f32;
             v.insert(i, vec);
         }
-        let mut g = HnswGraph::new();
+        let mut g = NswGraph::new();
         for i in 0..10u64 {
             let df = dist_fn(&v, &v[&i], MetricKind::L2);
             g.insert(i, &df).unwrap();
