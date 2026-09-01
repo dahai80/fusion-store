@@ -324,4 +324,4 @@ Grafana dashboard template: [`ops/grafana-dashboard.json`](ops/grafana-dashboard
 
 Default mode: fusion-store is consumed in-process as an embedded library (zero overhead); the fs-serve daemon is an optional management/monitoring surface.
 
-License: MIT
+License: Apache-2.0

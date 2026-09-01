@@ -7,7 +7,7 @@ name = "fusion-store"
 version = "0.1.0"
 description = "fusion-store Python 绑定（PyO3，读路径强制拷贝 E3）"
 requires-python = ">=3.8"
-license = { text = "MIT" }
+license = { text = "Apache-2.0" }
 dependencies = ["numpy>=1.21"]
 
 [tool.maturin]

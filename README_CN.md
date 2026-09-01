@@ -324,4 +324,4 @@ Grafana dashboard 模板：[`ops/grafana-dashboard.json`](ops/grafana-dashboard.
 
 默认模式：fusion-store 以嵌入式库被消费方 in-process 调用（零开销）；fs-serve daemon 为可选管理/监控面。
 
-License: MIT
+License: Apache-2.0

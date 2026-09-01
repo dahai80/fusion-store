@@ -4,6 +4,12 @@ fusion-store 版本变更记录。格式遵循 [Keep a Changelog](https://keepac
 
 ## [Unreleased]
 
+### 变更
+
+- 许可证由 MIT 切换为 Apache 2.0：删除 `LICENSE-MIT`，新增 `LICENSE`（Apache-2.0 全文）；
+  `Cargo.toml` / `fs-ffi-py/pyproject.toml` license 字段同步 `Apache-2.0`；
+  README / README_CN License 行同步。
+
 ## [0.2.0-rc.2] — 2026-08-28 (Pre-release)
 
 ### 定位
