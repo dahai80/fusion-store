@@ -8,7 +8,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-BINARY="$PROJECT_DIR/target/release/fusion-store"
+BINARY="$PROJECT_DIR/target/release/fs-serve"
 
 HOME_DIR="${FS_HOME:-$HOME/.fusion-store}"
 PORT="${FUSION_STORE_PORT:-11463}"
@@ -28,8 +28,8 @@ case "$cmd" in
             echo "[fusion-store] binary not found at $BINARY, run: cargo build --release -p fs-serve -p fs-cli"
             exit 1
         fi
-        echo "[fusion-store] starting serve --home $HOME_DIR --port $PORT --bind $BIND"
-        "$BINARY" serve \
+        echo "[fusion-store] starting fs-serve --home $HOME_DIR --port $PORT --bind $BIND"
+        "$BINARY" \
             --home "$HOME_DIR" \
             --port "$PORT" \
             --bind "$BIND" \

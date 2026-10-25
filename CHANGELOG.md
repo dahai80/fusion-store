@@ -4,11 +4,21 @@ fusion-store 版本变更记录。格式遵循 [Keep a Changelog](https://keepac
 
 ## [Unreleased]
 
+## [0.2.0-rc.3] — 2026-10-25 (Pre-release)
+
+rc.2 基线上的补丁版本：许可证切换 + 部署脚本修复，无 API 变更。
+
 ### 变更
 
 - 许可证由 MIT 切换为 Apache 2.0：删除 `LICENSE-MIT`，新增 `LICENSE`（Apache-2.0 全文）；
   `Cargo.toml` / `fs-ffi-py/pyproject.toml` license 字段同步 `Apache-2.0`；
   README / README_CN License 行同步。
+
+### 修复
+
+- `deploy/start.sh` 二进制路径与调用方式修复（#5）：
+  - `BINARY` 由不存在的 `target/release/fusion-store` 改为 `target/release/fs-serve`；
+  - 移除不存在的 `serve` 子命令，`--home/--port/--bind` 直接传给 `fs-serve`。
 
 ## [0.2.0-rc.2] — 2026-08-28 (Pre-release)
 
