@@ -49,5 +49,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: fusion-store-whl-macos-arm64
-          path: crates/fs-ffi-py/target/wheels/*.whl
+          # workspace 布局下 maturin 输出到根 target/wheels/，非 crate 内 target
+          path: target/wheels/*.whl
           if-no-files-found: error
