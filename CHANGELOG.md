@@ -4,6 +4,21 @@ fusion-store 版本变更记录。格式遵循 [Keep a Changelog](https://keepac
 
 ## [Unreleased]
 
+## [0.2.0-rc.4] — 2026-10-26 (Pre-release)
+
+rc.3 基线上的补丁版本：CI 修复，无 API 变更。
+
+### 修复
+
+- CI on main 转绿（#6，自 2026-08 起持续红）：
+  - `rustup` 步改为一次性 `--component rustfmt --component clippy` 安装 + 先 uninstall 陈旧 toolchain，
+    规避新 runner 镜像上 `rust-toolchain.toml` 补装 rustfmt 的
+    `detected conflict: 'bin/cargo-fmt'`（ci.yml 全部 job + wheel.yml）；
+  - `maturin develop` 补 virtualenv（历史失败的另一根因）；
+  - 移除 stable 矩阵变体——`rust-toolchain.toml` 固定 1.94，stable 变体实际测不到 stable；
+  - 撤掉 macos-13（Intel）矩阵——Apple Silicon 引擎非 Intel 产品目标，且该 job
+    全仓历史从未执行成功过一次（托管 Intel runner 恒排队→cancel）。
+
 ## [0.2.0-rc.3] — 2026-10-25 (Pre-release)
 
 rc.2 基线上的补丁版本：许可证切换 + 部署脚本修复，无 API 变更。
