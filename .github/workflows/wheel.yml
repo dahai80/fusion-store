@@ -2,6 +2,8 @@
 # fs-ffi-py（PyO3）arm64 wheel —— maturin build。push tag v* 触发，手工 workflow_dispatch 可跑。
 # 落地 PRD §771 #4：M3 先 maturin develop 本地用，CI 发布 arm64 wheel 纳入 M4。
 # F-OPS-2：发布前 maturin develop + pytest test_binding.py 验证绑定可用，再 build wheel。
+# issue #6：rustup 一次性带 --component 安装（避免 toml 补装 rustfmt 撞镜像冲突）；
+# maturin develop 必须在 virtualenv 内运行，建 venv 并逐步激活。
 name: wheel
 
 on:
@@ -16,21 +18,33 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: rustup toolchain
-        run: rustup toolchain install 1.94 --profile minimal && rustup default 1.94
+        run: |
+          rustup toolchain uninstall 1.94 2>/dev/null || true
+          rustup toolchain install 1.94 --profile minimal --component rustfmt --component clippy
+          rustup default 1.94
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install maturin + numpy + pytest
-        run: pip install 'maturin>=1.4,<2.0' numpy pytest
+      - name: Create venv + install maturin + numpy + pytest
+        run: |
+          python3 -m venv "$HOME/fs-py-venv"
+          source "$HOME/fs-py-venv/bin/activate"
+          pip install 'maturin>=1.4,<2.0' numpy pytest
       - name: maturin develop (verify binding before build)
         working-directory: crates/fs-ffi-py
-        run: maturin develop
+        run: |
+          source "$HOME/fs-py-venv/bin/activate"
+          maturin develop
       - name: pytest test_binding.py (F-OPS-2)
         working-directory: crates/fs-ffi-py
-        run: python -m pytest tests/test_binding.py -v
+        run: |
+          source "$HOME/fs-py-venv/bin/activate"
+          python -m pytest tests/test_binding.py -v
       - name: Build wheel (fs-ffi-py, arm64)
         working-directory: crates/fs-ffi-py
-        run: maturin build --release --interpreter python3
+        run: |
+          source "$HOME/fs-py-venv/bin/activate"
+          maturin build --release --interpreter python3
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
         with:

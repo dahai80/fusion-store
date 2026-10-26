@@ -8,19 +8,28 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# rustup 步骤说明（issue #6）：
+# - rust-toolchain.toml 声明 components=[rustfmt, clippy]，若先 --profile minimal 装链、
+#   再由 toml 触发补装组件，新 runner 镜像的 rustup 会在 rustfmt 上报
+#   "detected conflict: 'bin/cargo-fmt'"。改为一次性带 --component 安装。
+# - 先 uninstall 一次，规避镜像预装 1.94 的陈旧半装状态。
+# - 矩阵不再跑 stable 变体：rust-toolchain.toml 固定 1.94，目录内 cargo 永远解析到
+#   1.94，stable 变体测不到 stable，纯耗 runner。
 jobs:
   fmt-clippy-test:
-    name: fmt + clippy + test (${{ matrix.os }}, rust ${{ matrix.rust }})
+    name: fmt + clippy + test (${{ matrix.os }}, rust 1.94)
     strategy:
       fail-fast: false
       matrix:
         os: [macos-14, macos-13]
-        rust: ["1.94", "stable"]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - name: rustup toolchain
-        run: rustup toolchain install ${{ matrix.rust }} --profile minimal && rustup default ${{ matrix.rust }}
+        run: |
+          rustup toolchain uninstall 1.94 2>/dev/null || true
+          rustup toolchain install 1.94 --profile minimal --component rustfmt --component clippy
+          rustup default 1.94
       - name: cargo fmt
         run: cargo fmt --check
       - name: cargo clippy
@@ -37,31 +46,45 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: rustup toolchain
-        run: rustup toolchain install 1.94 --profile minimal && rustup default 1.94
+        run: |
+          rustup toolchain uninstall 1.94 2>/dev/null || true
+          rustup toolchain install 1.94 --profile minimal --component rustfmt --component clippy
+          rustup default 1.94
       - name: cargo clippy fs-ffi-py
         run: cargo clippy -p fs-ffi-py --all-targets -- -D warnings
       - name: cargo test fs-ffi-py (0 rust tests, compile only)
         run: cargo test -p fs-ffi-py
 
   # Python 绑定测试（maturin develop + pytest test_binding.py）
+  # maturin develop 必须在 virtualenv 内运行（issue #6 旧失败根因），故建 venv 并逐步激活。
   python-binding:
     name: Python binding tests
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
       - name: rustup toolchain
-        run: rustup toolchain install 1.94 --profile minimal && rustup default 1.94
+        run: |
+          rustup toolchain uninstall 1.94 2>/dev/null || true
+          rustup toolchain install 1.94 --profile minimal --component rustfmt --component clippy
+          rustup default 1.94
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install maturin + numpy + pytest
-        run: pip install 'maturin>=1.4,<2.0' numpy pytest
+      - name: Create venv + install maturin + numpy + pytest
+        run: |
+          python3 -m venv "$HOME/fs-py-venv"
+          source "$HOME/fs-py-venv/bin/activate"
+          pip install 'maturin>=1.4,<2.0' numpy pytest
       - name: maturin develop
         working-directory: crates/fs-ffi-py
-        run: maturin develop
+        run: |
+          source "$HOME/fs-py-venv/bin/activate"
+          maturin develop
       - name: pytest test_binding.py
         working-directory: crates/fs-ffi-py
-        run: python -m pytest tests/test_binding.py -v
+        run: |
+          source "$HOME/fs-py-venv/bin/activate"
+          python -m pytest tests/test_binding.py -v
 
   # 全规模基准趋势门禁（50K×768，验召回/延迟趋势，非 1M 全量——1M 人工定期跑）
   bench-scale:
@@ -70,6 +93,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: rustup toolchain
-        run: rustup toolchain install 1.94 --profile minimal && rustup default 1.94
+        run: |
+          rustup toolchain uninstall 1.94 2>/dev/null || true
+          rustup toolchain install 1.94 --profile minimal --component rustfmt --component clippy
+          rustup default 1.94
       - name: cargo run bench (50K×768, release)
         run: FS_BENCH_N=50000 FS_BENCH_DIM=768 cargo run --release -p fs-core --example full_scale_bench
