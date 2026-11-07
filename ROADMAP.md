@@ -1,3 +1,19 @@
+---
+doc_id: fusion-store/roadmap-guide
+product: fusion-store
+class: core
+entry: service
+doc_type: guide
+title: { zh: "演进路线", en: "Roadmap" }
+audience: engineer
+status: draft
+version: 0.2.0-rc.4
+updated: 2026-11-07
+owner: @dahai
+source_of_truth:
+  - ROADMAP.md
+---
+
 # Roadmap
 
 fusion-store 演进路线。当前 **0.2.0-rc.2**（0.2 线 RC，受控商用 / 技术预览）。**Path A `ShardedEngine` 分片薄层已落地**（0.2.0-rc.2，见下）。本文件记架构演进方向与容量边界，不承诺版本号时间。

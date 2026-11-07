@@ -1,3 +1,19 @@
+---
+doc_id: fusion-store/readme
+product: fusion-store
+class: core
+entry: service
+doc_type: readme
+title: { zh: "fusion-store", en: "fusion-store" }
+audience: engineer
+status: draft
+version: 0.2.0-rc.4
+updated: 2026-11-07
+owner: @dahai
+source_of_truth:
+  - README.md
+---
+
 # fusion-store
 
 > **Language**: **English** | [中文](README_CN.md)
@@ -25,8 +41,8 @@ Unifies three storage primitives, zero-copy **in-process**, eliminating serializ
 
 ## Design
 
-Authoritative spec: [`architecture/fusion-store-prd-0826.md`](../architecture/fusion-store-prd-0826.md) v2.0
-Landing plan: [`~/fusion/fusion-store-prd-plan-0826.md`](../fusion-store-prd-plan-0826.md) v2.0
+Authoritative spec: [`architecture/fusion-store-prd-0826.md`](https://github.com/dahai80/fusion-store) v2.0
+Landing plan: [`architecture/fusion-store-prd-plan-0826.md`](https://github.com/dahai80/fusion-store) v2.0
 
 Core constraints:
 - Segment append-only immutable (sealed read-only when full, never truncate/grow/in-place mutate) → eradicates SIGBUS and concurrent tearing
@@ -110,7 +126,7 @@ Four honesty corrections (no uncontrollable large refactor; landed via the audit
 | Item | Status |
 |------|--------|
 | Arrow columnar write/read (real buffer roundtrip, not mock, E4) | ✅ |
-| Zero-copy read: Buffer::from_custom_allocation + Arc<MmapHandle> keepalive | ✅ |
+| Zero-copy read: `Buffer::from_custom_allocation` + `Arc<MmapHandle>` keepalive | ✅ |
 | Columnar projection (subset columns) | ✅ |
 | null column / unsupported type rejected | ✅ |
 | C-ABI `fs_store_search_knn` end-to-end (C program links header + static lib and runs) | ✅ |
@@ -178,7 +194,7 @@ Four honesty corrections (no uncontrollable large refactor; landed via the audit
 
 **ef_search tuning note**: Single-layer NSW has no multi-layer shortcut; ef_s=50 recall stuck at 0.925, not meeting PRD §2.5 ≥0.95. Raising to ef_s=200 gives recall 0.995, p99 still <1ms (5ms budget ample). PRD "ef_s=50 fixed" conflicts with §2.5 recall SLA; take the recall SLA as hard acceptance, tune ef_s first at the tuning stage ("fix then tune" iterative stage).
 
-**Write-performance fix note**: The original `insert_batch` rescanned all N old vectors into a RAM map per batch → O(N²) copy, infeasible at 1M. Changed to zero-copy mmap slice read (`ZeroCopyVec` holds Arc<MmapHandle> keepalive) + locator in-memory cache (16B/item metadata, not vector bytes; H1 still vectors in mmap segment) + incremental edge-linking without re-reading old vectors. Eliminated per-hop heed read_txn + serde deserialization + Vec<f32> allocation. 50K×768 write ~1195 vecs/s (before the fix 1M ran 2hr to only ~480K/1M = 67 vecs/s).
+**Write-performance fix note**: The original `insert_batch` rescanned all N old vectors into a RAM map per batch → O(N²) copy, infeasible at 1M. Changed to zero-copy mmap slice read (`ZeroCopyVec` holds `Arc<MmapHandle>` keepalive) + locator in-memory cache (16B/item metadata, not vector bytes; H1 still vectors in mmap segment) + incremental edge-linking without re-reading old vectors. Eliminated per-hop heed read_txn + serde deserialization + `Vec<f32>` allocation. 50K×768 write ~1195 vecs/s (before the fix 1M ran 2hr to only ~480K/1M = 67 vecs/s).
 
 **Downscale note**: M2 used 1000×128 to verify graph edge-linking, hopping, recall-correctness trends. PRD §2.5 full-scale benchmark (1M×768) deferred to a unified M4 benchmark (needs a stable write path after WAL landed + a real embedding set).
 

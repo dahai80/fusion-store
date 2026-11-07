@@ -14,7 +14,7 @@ on:
 
 jobs:
   macos-arm64:
-    runs-on: macos-14
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - name: rustup toolchain

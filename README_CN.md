@@ -1,3 +1,19 @@
+---
+doc_id: fusion-store/readme-cn
+product: fusion-store
+class: core
+entry: service
+doc_type: readme
+title: { zh: "fusion-store", en: "fusion-store" }
+audience: engineer
+status: draft
+version: 0.2.0-rc.4
+updated: 2026-11-07
+owner: @dahai
+source_of_truth:
+  - README_CN.md
+---
+
 # fusion-store
 
 > **语言 / Language**: [English](README.md) | **中文**
@@ -25,8 +41,8 @@
 
 ## 设计
 
-权威规范：[`architecture/fusion-store-prd-0826.md`](../architecture/fusion-store-prd-0826.md) v2.0
-落地计划：[`~/fusion/fusion-store-prd-plan-0826.md`](../fusion-store-prd-plan-0826.md) v2.0
+权威规范：[`architecture/fusion-store-prd-0826.md`](https://github.com/dahai80/fusion-store) v2.0
+落地计划：[`architecture/fusion-store-prd-plan-0826.md`](https://github.com/dahai80/fusion-store) v2.0
 
 核心约束：
 - 段 append-only 不可变（写满封存只读，永不 truncate/grow/就地改）→ 根治 SIGBUS 与并发撕裂
@@ -65,7 +81,7 @@ crates/
   fs-ffi-c/   # C-ABI 绑定（staticlib + cdylib，导出 fs_store.h）
 ```
 
-里程碑（per PRD v2.0 roadmap）：
+交付节点（per PRD v2.0 roadmap）：
 - M0 — workspace 骨架 + fs-core trait ✅
 - M1 — mem 段 + 块分配器 + heed KV + namespace 配额 ✅
 - M2 — NSW 图常驻 RAM + snapshot + NEON SIMD 位等 + batch ✅
@@ -88,7 +104,7 @@ pub trait FusionStoreEngine {
 
 ## 状态
 
-Greenfield → M0 完成（workspace 骨架 + fs-core trait）。M1 完成（KV + mmap 段）。M2 完成（NSW 图常驻 RAM + snapshot + NEON SIMD 位等 + batch）。M3 完成（Arrow 定长原语列式 + C-ABI + 读强制拷贝 + Python 绑定 fs-ffi-py）。M4 完成（WAL 幂等 + recover + compact COW + fs-serve + 背压 + prometheus + SLA）。审计 30 缺陷全修复（A1-A7 / R1-R10 / E1-E13）+ 生产就绪审计 P0-P3 全修复（见审计纠偏节）。PRD v2.0 roadmap 全里程碑 + 全延后项落地，141 测试全绿（debug + release 双绿，含 9 例 proptest fuzz harness F-TEST-2 + 1 例非环回启动门禁 F-SEC-1 + 9 例 ShardedEngine 分片测试；fs-ffi-py 7 Python 测试另计，maturin 开发环境）。**当前 0.2.0-rc.2（Pre-release，0.2 线 RC）** —— 受控商用 / 技术预览档达标（审计 P0/P1 闭环）；NSW 规模演进 Path A `ShardedEngine` 分片薄层已落地（见下节，rc.2 候选），下一步 0.2.0 稳定。向量读取/枚举 API（`get_vector`/`list_vector_ids`）+ 删除 API 经 Engine trait → C-ABI → Python 三层全暴露（#2/#3）。RBAC + audit log + token file + body limit + /stats 认证门禁 + 非环回无 token 拒启动 hard fail（F-SEC-2/F-SEC-7/F-SEC-1/F-OPS-8）。
+Greenfield → M0 完成（workspace 骨架 + fs-core trait）。M1 完成（KV + mmap 段）。M2 完成（NSW 图常驻 RAM + snapshot + NEON SIMD 位等 + batch）。M3 完成（Arrow 定长原语列式 + C-ABI + 读强制拷贝 + Python 绑定 fs-ffi-py）。M4 完成（WAL 幂等 + recover + compact COW + fs-serve + 背压 + prometheus + SLA）。审计 30 缺陷全修复（A1-A7 / R1-R10 / E1-E13）+ 生产就绪审计 P0-P3 全修复（见审计纠偏节）。PRD v2.0 roadmap 全部节点 + 全延后项落地，141 测试全绿（debug + release 双绿，含 9 例 proptest fuzz harness F-TEST-2 + 1 例非环回启动门禁 F-SEC-1 + 9 例 ShardedEngine 分片测试；fs-ffi-py 7 Python 测试另计，maturin 开发环境）。**当前 0.2.0-rc.2（Pre-release，0.2 线 RC）** —— 受控商用 / 技术预览档达标（审计 P0/P1 闭环）；NSW 规模演进 Path A `ShardedEngine` 分片薄层已落地（见下节，rc.2 候选），下一步 0.2.0 稳定。向量读取/枚举 API（`get_vector`/`list_vector_ids`）+ 删除 API 经 Engine trait → C-ABI → Python 三层全暴露（#2/#3）。RBAC + audit log + token file + body limit + /stats 认证门禁 + 非环回无 token 拒启动 hard fail（F-SEC-2/F-SEC-7/F-SEC-1/F-OPS-8）。
 
 ### 审计纠偏（A2/A4/A7/E6）
 
@@ -110,7 +126,7 @@ Greenfield → M0 完成（workspace 骨架 + fs-core trait）。M1 完成（KV 
 | 项 | 状态 |
 |----|------|
 | Arrow 列式写读（真实 buffer 往返，非 mock，E4） | ✅ |
-| 零拷贝读：Buffer::from_custom_allocation + Arc<MmapHandle> 保活 | ✅ |
+| 零拷贝读：`Buffer::from_custom_allocation` + `Arc<MmapHandle>` 保活 | ✅ |
 | 列式投影（subset columns） | ✅ |
 | null 列 / 不支持类型拒收 | ✅ |
 | C-ABI `fs_store_search_knn` 端到端通（C 程序经头+静态库链接运行） | ✅ |
@@ -178,7 +194,7 @@ Greenfield → M0 完成（workspace 骨架 + fs-core trait）。M1 完成（KV 
 
 **ef_search 调参说明**：单层 NSW 无多层捷径，ef_s=50 召回卡 0.925 不达 PRD §2.5 ≥0.95。提至 ef_s=200 后召回 0.995、p99 仍 <1ms（5ms 预算充足）。PRD「ef_s=50 固定」与 §2.5 召回 SLA 冲突，取召回 SLA 为硬验收，调参阶段先提 ef_s（参数「先固定后调参」阶段迭代）。
 
-**写入性能修复说明**：原 `insert_batch` 每批 rescan 全部 N 旧向量入 RAM map → O(N²) 拷贝，1M 不可行。改为零拷贝 mmap 切片读（`ZeroCopyVec` 持 Arc<MmapHandle> 保活）+ locator 内存缓存（16B/项元数据，非向量字节，H1 仍向量在 mmap 段）+ 增量连边不复读旧向量。消除每跳 heed read_txn + serde 反序列化 + Vec<f32> 分配。50K×768 写入 ~1195 vecs/s（修前 1M 跑 2hr 仅 ~480K/1M = 67 vecs/s）。
+**写入性能修复说明**：原 `insert_batch` 每批 rescan 全部 N 旧向量入 RAM map → O(N²) 拷贝，1M 不可行。改为零拷贝 mmap 切片读（`ZeroCopyVec` 持 `Arc<MmapHandle>` 保活）+ locator 内存缓存（16B/项元数据，非向量字节，H1 仍向量在 mmap 段）+ 增量连边不复读旧向量。消除每跳 heed read_txn + serde 反序列化 + `Vec<f32>` 分配。50K×768 写入 ~1195 vecs/s（修前 1M 跑 2hr 仅 ~480K/1M = 67 vecs/s）。
 
 **降规模说明**：M2 用 1000×128 验证图连边、跳转、召回正确性趋势。PRD §2.5 全规模基准（1M×768）留 M4 统一基准（需 WAL 落地后的稳定写入路径 + 真实嵌入向量集）。
 
