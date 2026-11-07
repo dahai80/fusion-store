@@ -41,8 +41,8 @@ source_of_truth:
 
 ## 设计
 
-权威规范：[`architecture/fusion-store-prd-0826.md`](../architecture/fusion-store-prd-0826.md) v2.0
-落地计划：[`architecture/fusion-store-prd-plan-0826.md`](../architecture/fusion-store-prd-plan-0826.md) v2.0
+权威规范：[`architecture/fusion-store-prd-0826.md`](https://github.com/dahai80/fusion-store) v2.0
+落地计划：[`architecture/fusion-store-prd-plan-0826.md`](https://github.com/dahai80/fusion-store) v2.0
 
 核心约束：
 - 段 append-only 不可变（写满封存只读，永不 truncate/grow/就地改）→ 根治 SIGBUS 与并发撕裂

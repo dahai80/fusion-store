@@ -41,8 +41,8 @@ Unifies three storage primitives, zero-copy **in-process**, eliminating serializ
 
 ## Design
 
-Authoritative spec: [`architecture/fusion-store-prd-0826.md`](../architecture/fusion-store-prd-0826.md) v2.0
-Landing plan: [`architecture/fusion-store-prd-plan-0826.md`](../architecture/fusion-store-prd-plan-0826.md) v2.0
+Authoritative spec: [`architecture/fusion-store-prd-0826.md`](https://github.com/dahai80/fusion-store) v2.0
+Landing plan: [`architecture/fusion-store-prd-plan-0826.md`](https://github.com/dahai80/fusion-store) v2.0
 
 Core constraints:
 - Segment append-only immutable (sealed read-only when full, never truncate/grow/in-place mutate) → eradicates SIGBUS and concurrent tearing
