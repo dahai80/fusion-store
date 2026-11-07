@@ -1,3 +1,19 @@
+---
+doc_id: fusion-store/changelog
+product: fusion-store
+class: core
+entry: service
+doc_type: changelog
+title: { zh: "更新日志", en: "Changelog" }
+audience: engineer
+status: draft
+version: 0.2.0-rc.4
+updated: 2026-11-07
+owner: @dahai
+source_of_truth:
+  - CHANGELOG.md
+---
+
 # Changelog
 
 fusion-store 版本变更记录。格式遵循 [Keep a Changelog](https://keepachangelog.com/)，版本号语义化（SemVer）。
@@ -113,7 +129,7 @@ rc.2 基线上的补丁版本：许可证切换 + 部署脚本修复，无 API �
 
 ## [0.1.0] — 审计前基线（commit 47d5b83）
 
-### 里程碑（PRD v2.0 roadmap 全落地）
+### 阶段交付（PRD v2.0 roadmap 全落地）
 - **M0** — workspace 骨架 + fs-core trait。
 - **M1** — mmap 段 + 块分配器 + heed KV + namespace 配额。
 - **M2** — 单层 NSW 图常驻 RAM + snapshot + NEON SIMD 位等 + batch。全规模 1M×768 基准：召回 0.995 / p99 1544us / 图 RAM 415MB。

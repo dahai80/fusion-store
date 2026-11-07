@@ -1,3 +1,19 @@
+---
+doc_id: fusion-store/releasing-guide
+product: fusion-store
+class: core
+entry: service
+doc_type: guide
+title: { zh: "发布流程", en: "Release process" }
+audience: engineer
+status: draft
+version: 0.2.0-rc.4
+updated: 2026-11-07
+owner: @dahai
+source_of_truth:
+  - RELEASING.md
+---
+
 # Releasing
 
 fusion-store 发布流程。版本号语义化（SemVer），当前 0.1.0（M0-M4 + 审计修复完成，预 1.0）。
@@ -39,7 +55,7 @@ workspace 单版本（`Cargo.toml` `[workspace.package] version`），各 crate 
 
 1. **门禁全绿**（上节 1-4）。
 2. **更新 CHANGELOG.md**：本次版本条目，从 `Unreleased` 移至版本号 + 日期。
-3. **更新 README.md 状态行**：测试数 / 里程碑 / 缺陷修复计数同步。
+3. **更新 README.md 状态行**：测试数 / 交付节点 / 缺陷修复计数同步。
 4. **commit**：`chore(release): vX.Y.Z`（中文 commit message 用 `发布 vX.Y.Z`）。
 5. **tag**：`git tag vX.Y.Z && git push origin vX.Y-Z`——触发 wheel.yml 构建 arm64 wheel 并上传 artifact。
 6. **GitHub Release**：基于 tag 建 Release，贴 CHANGELOG 段 + wheel artifact 下载链接。

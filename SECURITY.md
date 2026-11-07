@@ -1,3 +1,19 @@
+---
+doc_id: fusion-store/security-guide
+product: fusion-store
+class: core
+entry: service
+doc_type: guide
+title: { zh: "安全策略", en: "Security policy" }
+audience: engineer
+status: draft
+version: 0.2.0-rc.4
+updated: 2026-11-07
+owner: @dahai
+source_of_truth:
+  - SECURITY.md
+---
+
 # Security Policy
 
 ## Scope

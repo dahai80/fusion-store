@@ -1,3 +1,19 @@
+---
+doc_id: fusion-store/claude-guide
+product: fusion-store
+class: core
+entry: service
+doc_type: guide
+title: { zh: "Claude Code 工程指南", en: "Claude Code engineering guide" }
+audience: engineer
+status: draft
+version: 0.2.0-rc.4
+updated: 2026-11-07
+owner: @dahai
+source_of_truth:
+  - CLAUDE.md
+---
+
 # CLAUDE.md
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
