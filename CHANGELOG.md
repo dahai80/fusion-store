@@ -7,7 +7,7 @@ doc_type: changelog
 title: { zh: "更新日志", en: "Changelog" }
 audience: engineer
 status: draft
-version: 0.2.0-rc.4
+version: 0.2.0-rc.5
 updated: 2026-11-07
 owner: @dahai
 source_of_truth:
@@ -19,6 +19,24 @@ source_of_truth:
 fusion-store 版本变更记录。格式遵循 [Keep a Changelog](https://keepachangelog.com/)，版本号语义化（SemVer）。
 
 ## [Unreleased]
+
+## [0.2.0-rc.5] — 2026-11-07 (Pre-release)
+
+rc.4 基线上的补丁版本：文档体系接入 + CI runner 修复，无 API 变更。
+
+### 新增
+
+- 接入 fusion docs-system v1.1 契约（core x service）（#7）：
+  - 新增 `docs/` 六页结构化文档（product-page / get-started / architecture / api-reference / config-reference / troubleshooting）；
+  - 全部顶层文档（README / CHANGELOG / ROADMAP / SECURITY / RELEASING / CLAUDE.md）加 v1.1 frontmatter；
+  - 新增 `ci/validate_docs.py`（725 行文档契约校验器）+ `docs.yml` 工作流（ubuntu-latest 校验门禁）。
+
+### 修复
+
+- CI runner 标签：GitHub 退役 `macos-14` 标签（jobs 报
+  `configuration macos-14-arm64-us-default not supported`），ci.yml / wheel.yml 全部 `runs-on` 换 `macos-latest`
+  （arm64 macOS，toolchain 由 `rust-toolchain.toml` 固定 1.94，不受标签漂移影响）；
+  顺带修复 README 失效 spec 链接。
 
 ## [0.2.0-rc.4] — 2026-10-26 (Pre-release)
 
