@@ -12,11 +12,27 @@ on:
       - "v*"
   workflow_dispatch:
 
+# Never cancel an in-flight release build (issue #8): tag runs are rare and
+# publishing artifacts is the whole point; group only guards duplicates.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   macos-arm64:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Cache cargo downloads (issue #8, keyed on lockfile hash)
+        uses: actions/cache@v4
+        with:
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
       - name: rustup toolchain
         run: |
           rustup toolchain uninstall 1.94 2>/dev/null || true

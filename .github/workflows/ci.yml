@@ -3,10 +3,19 @@ name: ci
 on:
   push:
     branches: [main, master]
+    paths-ignore: ["**.md", "docs/**", "LICENSE"]
   pull_request:
+    paths-ignore: ["**.md", "docs/**", "LICENSE"]
 
 env:
   CARGO_TERM_COLOR: always
+
+# Cancel superseded runs on the same ref (issue #8): docs-only pushes are
+# already skipped via paths-ignore; this drops queued runs replaced by a
+# newer commit. Docs-only changes are gated by the separate docs workflow.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 # rustup 步骤说明（issue #6）：
 # - rust-toolchain.toml 声明 components=[rustfmt, clippy]，若先 --profile minimal 装链、
@@ -32,6 +41,16 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: Cache cargo downloads (issue #8, keyed on lockfile hash)
+        uses: actions/cache@v4
+        with:
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
       - name: rustup toolchain
         run: |
           rustup toolchain uninstall 1.94 2>/dev/null || true
@@ -52,6 +71,16 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Cache cargo downloads (issue #8, keyed on lockfile hash)
+        uses: actions/cache@v4
+        with:
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
       - name: rustup toolchain
         run: |
           rustup toolchain uninstall 1.94 2>/dev/null || true
@@ -69,6 +98,16 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Cache cargo downloads (issue #8, keyed on lockfile hash)
+        uses: actions/cache@v4
+        with:
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
       - name: rustup toolchain
         run: |
           rustup toolchain uninstall 1.94 2>/dev/null || true
@@ -99,6 +138,16 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Cache cargo downloads (issue #8, keyed on lockfile hash)
+        uses: actions/cache@v4
+        with:
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
       - name: rustup toolchain
         run: |
           rustup toolchain uninstall 1.94 2>/dev/null || true

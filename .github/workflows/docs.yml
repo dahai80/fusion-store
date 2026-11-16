@@ -7,6 +7,11 @@ on:
       - "ci/validate_docs.py"
       - ".github/workflows/docs.yml"
 
+# Cancel superseded docs runs on the same ref (issue #8).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   validate:
     runs-on: ubuntu-latest
