@@ -7,8 +7,8 @@ doc_type: changelog
 title: { zh: "更新日志", en: "Changelog" }
 audience: engineer
 status: draft
-version: 0.2.0-rc.5
-updated: 2026-11-07
+version: 0.2.0-rc.6
+updated: 2026-11-16
 owner: "@dahai"
 source_of_truth:
   - CHANGELOG.md
@@ -19,6 +19,24 @@ source_of_truth:
 fusion-store 版本变更记录。格式遵循 [Keep a Changelog](https://keepachangelog.com/)，版本号语义化（SemVer）。
 
 ## [Unreleased]
+
+## [0.2.0-rc.6] — 2026-11-16 (Pre-release)
+
+rc.5 基线上的补丁版本：CI 效率改造，无 API 变更。
+
+### 新增
+
+- CI 效率改造（#8，对应 fusion#2 检查单，经 PR #9 落地）：
+  - `concurrency` 按 ref 分组：ci.yml / docs.yml `cancel-in-progress: true`；
+    wheel.yml 分组但不取消（保护在途 release 构建）；
+  - cargo 依赖下载缓存：ci.yml / wheel.yml 全 cargo job 接 `actions/cache`，
+    key 取 `Cargo.lock` + `rust-toolchain.toml` 哈希（target 目录有意不缓存）；
+  - ci.yml 增加 `paths-ignore`（markdown / docs / LICENSE），纯文档变更跳过测试 job。
+
+### 评估
+
+- 测试分片：不需要——最长 job 墙钟 <3 分钟（141 测试单 job）；
+- 分层 nightly：不需要——全量套件（含 50K 基准门禁）每次 push/PR 约 4 分钟墙钟。
 
 ## [0.2.0-rc.5] — 2026-11-07 (Pre-release)
 
