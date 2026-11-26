@@ -7,8 +7,8 @@ doc_type: changelog
 title: { zh: "更新日志", en: "Changelog" }
 audience: engineer
 status: draft
-version: 0.2.0-rc.6
-updated: 2026-11-16
+version: 0.2.0-rc.7
+updated: 2026-11-26
 owner: "@dahai"
 source_of_truth:
   - CHANGELOG.md
@@ -19,6 +19,23 @@ source_of_truth:
 fusion-store 版本变更记录。格式遵循 [Keep a Changelog](https://keepachangelog.com/)，版本号语义化（SemVer）。
 
 ## [Unreleased]
+
+## [0.2.0-rc.7] — 2026-11-26 (Pre-release)
+
+rc.6 基线上的补丁版本：English-only source batch 2 + 构建残留清理，无 API 变更。
+
+### 变更
+
+- **English-only source batch 2**（#11，对应 fusion#9，经 PR #12 落地）：
+  全部包源码内未标记 CJK 行（约 1450 行，40 文件：模块文档 / 行内注释 /
+  clap help / PyO3 pymethod 文档 / pytest 注释）翻译为英文；
+  `ci/validate_docs.py` 的 `FORBIDDEN_ZH` 块列表数据标记 `# i18n: user-facing`；
+  运行时行为不变，141 Rust + 7 Python 测试绿，CJK 残留 0。
+
+### 修复
+
+- 审计 #10：本地 `target/` 构建残留（17G，可再生）已 `cargo clean` 清零；
+  CI runner 为临时盘不累积。
 
 ## [0.2.0-rc.6] — 2026-11-16 (Pre-release)
 
