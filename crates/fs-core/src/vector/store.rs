@@ -1,35 +1,42 @@
-//! 向量索引存储 —— vec mmap 段 + id→locator + NSW 图常驻 RAM [v2 H1/E2]
+//! Vector index storage — vec mmap segments + id→locator + NSW graph resident in RAM [v2 H1/E2]
 //!
-//! 一个 VectorIndex 持：
-//! - VecSegmentPool：append-only mmap 段存原始 f32 向量（fixed dim）
-//! - heed id→ValueLocator：向量定位信息（id 唯一）
-//! - NswGraph：纯拓扑常驻 RAM，距离由本模块注入（零拷贝读 mmap 向量算）
-//! - schema：dim/metric 建库锁定（E2）
+//! One VectorIndex holds:
+//! - VecSegmentPool: append-only mmap segments storing raw f32 vectors (fixed dim)
+//! - heed id→ValueLocator: vector location metadata (id unique)
+//! - NswGraph: pure topology resident in RAM, distances injected by this module
+//!   (computed by zero-copy reads of mmap'd vectors)
+//! - schema: dim/metric locked at index creation (E2)
 //!
-//! insert：append 向量 → 写 locator → 图连边（dist 闭包读 mmap 向量）。
-//! search_knn：图检索，dist 闭包按 id 取向量零拷贝算距离。
-//! delete：图软删（向量字节不动，M4 compact 回收）。
-//! snapshot/restore：图拓扑落单 mmap 段（snapshot.rs）。
+//! insert: append vector → write locator → link graph edges (dist closure reads mmap vectors).
+//! search_knn: graph search; the dist closure fetches vectors by id zero-copy to compute distance.
+//! delete: graph soft delete (vector bytes untouched, reclaimed by M4 compact).
+//! snapshot/restore: graph topology lands in a single mmap segment (snapshot.rs).
 //!
-//! ## E6：全局锁顺序不变量（多锁系统必须文档化，防维护者死锁）
+//! ## E6: Global lock-order invariant (multi-lock systems must be documented to prevent
+//! maintainer-introduced deadlocks)
 //!
-//! VectorIndex 持三把 in-process 锁：`pool: RwLock<VecSegmentPool>`、
-//! `graph: RwLock<NswGraph>`、`locators: RwLock<HashMap>`。所有路径获取顺序固定：
+//! VectorIndex holds three in-process locks: `pool: RwLock<VecSegmentPool>`,
+//! `graph: RwLock<NswGraph>`, `locators: RwLock<HashMap>`. Every path acquires them in a
+//! fixed order:
 //!
-//! | 路径 | 获取顺序 | 说明 |
+//! | Path | Acquisition order | Notes |
 //! |------|----------|------|
-//! | insert | pool.write → drop → graph.write | 先写段+locator，释放 pool 后再连边；graph.write 内 dist 闭包经 vec_slice 取 pool.read（读锁，不与已释放的 pool.write 嵌套） |
-//! | insert_batch | pool.write → drop → graph.write | 同 insert，batch 内连边复用 vec_slice 零拷贝读 |
-//! | search_knn | graph.read → vec_slice→pool.read | 读路径全程读锁，KNN 并发不被 insert/compact 互斥（R1 修复：vec_slice 不再需 pool.write） |
-//! | delete | graph.write（仅标 deleted） | 不动 pool/locators，单 graph 写锁 |
-//! | compact | pool.read（scan）→ pool.write（append 新段）→ graph.write（重建） | scan 活向量用 pool.read 不阻塞 KNN；append 新段持 pool.write 与 KNN 读互斥但窗口短；重建图持 graph.write |
+//! | insert | pool.write → drop → graph.write | Writes segment+locator first, releases pool, then links edges; inside graph.write the dist closure takes pool.read via vec_slice (read lock, not nested with the already-released pool.write) |
+//! | insert_batch | pool.write → drop → graph.write | Same as insert; batch edge-building reuses vec_slice zero-copy reads |
+//! | search_knn | graph.read → vec_slice→pool.read | Read path holds read locks throughout; KNN concurrency is never excluded by insert/compact (R1 fix: vec_slice no longer needs pool.write) |
+//! | delete | graph.write (only marks deleted) | Touches neither pool nor locators; single graph write lock |
+//! | compact | pool.read (scan) → pool.write (append new segments) → graph.write (rebuild) | Scanning live vectors uses pool.read and does not block KNN; appending new segments holds pool.write, mutually exclusive with KNN reads but short-window; rebuilding the graph holds graph.write |
 //!
-//! **不变量**：`pool` 与 `graph` 永不嵌套同持写锁——insert/batch 先 drop(pool) 再取 graph.write，
-//! 连边闭包内只取 pool.read（读，可与他人读共享）。search 全程 graph.read + pool.read，纯读。
-//! compact 的 pool.write 仅覆盖 append 新段瞬间，scan 阶段用 pool.read 不阻塞读。新增路径若需
-//! 同时改 pool + graph，必须保持「先 pool 写并释放，再 graph 写」顺序，禁止反向嵌套。
-//! R1 修复后 search 不再持 pool.write（旧实现 vec_slice 需写锁建 active handle 缓存，现改
-//! pool 内部 RwLock<HandleCache> 读锁命中），KNN 与 insert/compact 在 pool 锁上不再互斥。
+//! **Invariant**: `pool` and `graph` are never write-locked nested together — insert/batch
+//! drops pool before taking graph.write, and the edge-building closure only takes pool.read
+//! (read, shareable with other readers). search holds graph.read + pool.read throughout,
+//! pure reads. compact's pool.write only covers the instant of appending new segments; the
+//! scan phase uses pool.read and does not block reads. Any new path that must modify both
+//! pool and graph must keep the order "write pool and release first, then write graph";
+//! reverse nesting is forbidden.
+//! After the R1 fix, search no longer holds pool.write (the old vec_slice needed a write
+//! lock to build the active handle cache; now the internal RwLock<HandleCache> read lock
+//! hits the cache), so KNN no longer mutually excludes insert/compact on the pool lock.
 
 use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
@@ -48,38 +55,47 @@ use crate::vector::nsw::NswGraph;
 use crate::vector::schema::VectorSchema;
 use crate::vector::simd;
 
-/// 向量段默认容量（128MB —— 768 维 f32 单向量 3KB，约 4.5 万向量/段）
+/// Default vector segment capacity (128MB — a 768-dim f32 vector is 3KB, ~45K vectors/segment)
 const DEFAULT_VEC_SEGMENT_SIZE: u64 = 128 * 1024 * 1024;
-/// 封存段只读映射缓存容量上限（A4：LRU 淘汰，与 SegmentPool 对称）
+/// Sealed segment read-only mapping cache capacity cap (A4: LRU eviction, symmetric with SegmentPool)
 const VEC_SEALED_CACHE_CAP: usize = 64;
-/// A5：reclaim 硬下限安全期（封存后等待 in-flight reader 释放 Arc 的最短时长）。
-/// 过此期 OR strong_count==1 才允许物理删段文件，免删仍被零拷贝读的段。
-/// pub：compact.rs 的 DEFAULT_RECLAIM_SAFETY（建议 caller 等待）≥ 此值，杜绝两常量漂移（E7）。
+/// A5: reclaim hard-limit safety period (minimum time to wait after sealing for in-flight
+/// readers to drop their Arc). Physical segment file deletion is allowed only after this
+/// period has elapsed OR strong_count==1, preventing deletion of segments still being read
+/// zero-copy.
+/// pub: so compact.rs's DEFAULT_RECLAIM_SAFETY (the wait recommended to callers) ≥ this value,
+/// preventing drift between the two constants (E7).
 pub const MIN_RECLAIM_SAFETY: std::time::Duration = std::time::Duration::from_secs(2);
 const RECLAIM_SAFETY: std::time::Duration = MIN_RECLAIM_SAFETY;
-/// id→locator 库名
+/// id→locator database name
 const VEC_LOCATOR_DB: &str = "vec_locators";
-/// schema 元信息 key
+/// schema metadata key
 const SCHEMA_KEY: &[u8] = b"schema";
-/// F-CODE-1：向量 heed env map_size 上限（vec_meta：locator + schema）。
-/// locator 16B/项，256MB ≈ 1600 万向量（远超单机向量 namespace 典型规模）；
-/// 写满抛 MapFull（非 panic），caller 据此告警或重建更大 map_size。
+/// F-CODE-1: vector heed env map_size cap (vec_meta: locator + schema).
+/// At 16B per locator entry, 256MB ≈ 16M vectors (far beyond typical single-host vector
+/// namespace scale); filling it raises MapFull (not panic), and callers can alert or rebuild
+/// with a larger map_size accordingly.
 const VEC_META_MAP_SIZE: usize = 256 * 1024 * 1024;
 
-/// 读侧句柄缓存 —— 封存段映射 + active 段只读映射 + LRU + 封存时刻。
-/// R1：独立出来放 RwLock 内部可变，使读路径（vec_slice/read_vec）仅持 RwLock 读锁即可
-/// 读缓存命中（无争用，并发 KNN 互不阻塞）。仅在缓存未命中（首次开某段）时升写锁建缓存。
-/// compact 持 RwLock 写锁做 append 时，KNN 读路径持 RwLock 读锁命中缓存 + 不抢 pool.write，
-/// 不再因 vec_slice 抢 pool.write 而全量阻塞。
+/// Read-side handle cache — sealed segment mappings + active segment read-only mapping +
+/// LRU + seal timestamps.
+/// R1: split out so mutability lives inside an RwLock, letting the read path
+/// (vec_slice/read_vec) take only the RwLock read lock on cache hits (no contention; concurrent
+/// KNN lookups never block each other). The write lock is taken only on a cache miss (first
+/// open of some segment) to build the entry.
+/// When compact holds the RwLock write lock to append, KNN read paths hold the RwLock read
+/// lock, hit the cache, and never contend for pool.write — no more full blocking caused by
+/// vec_slice grabbing pool.write.
 struct HandleCache {
-    // 封存段只读映射缓存（seg_id -> Arc<MmapHandle>）
+    // Sealed segment read-only mapping cache (seg_id -> Arc<MmapHandle>)
     sealed: HashMap<u32, Arc<MmapHandle>>,
-    // A4：LRU 顺序队列（与 SegmentPool 对称，防无界 mmap 增长）
+    // A4: LRU order queue (symmetric with SegmentPool, prevents unbounded mmap growth)
     sealed_lru: VecDeque<u32>,
-    // A5：封存时刻（seg_id -> 封存 Instant），reclaim 安全期校验用
+    // A5: seal timestamps (seg_id -> seal Instant), used for reclaim safety-period checks
     sealed_time: HashMap<u32, std::time::Instant>,
-    // active 段只读映射缓存 —— 零拷贝读 active 段免每次重新 mmap（性能）。
-    // 封存轮转后失效重建（seal_and_rotate 置 None）。MAP_SHARED 与 active_mmap 字节一致。
+    // Active segment read-only mapping cache — zero-copy reads of the active segment skip
+    // re-mmap on every access (performance). Invalidated and rebuilt on seal rotation
+    // (seal_and_rotate sets None). MAP_SHARED keeps bytes consistent with active_mmap.
     active_read: Option<Arc<MmapHandle>>,
 }
 
@@ -93,7 +109,7 @@ impl HandleCache {
         }
     }
 
-    /// A4：LRU 触碰——seg_id 移到队尾
+    /// A4: LRU touch — move seg_id to the queue tail
     fn touch(&mut self, seg_id: u32) {
         if let Some(pos) = self.sealed_lru.iter().position(|&s| s == seg_id) {
             self.sealed_lru.remove(pos);
@@ -101,8 +117,9 @@ impl HandleCache {
         }
     }
 
-    /// A4：LRU 淘汰——超 VEC_SEALED_CACHE_CAP 从队首回收。
-    /// strong_count==1（无 reader 持）才 munmap；count>1 跳过保零拷贝指针有效。
+    /// A4: LRU eviction — reclaim from the queue head when over VEC_SEALED_CACHE_CAP.
+    /// munmap only when strong_count==1 (no readers); count>1 is skipped to keep zero-copy
+    /// pointers valid.
     fn evict(&mut self) {
         while self.sealed_lru.len() > VEC_SEALED_CACHE_CAP {
             let candidate = match self.sealed_lru.pop_front() {
@@ -128,7 +145,7 @@ impl HandleCache {
         }
     }
 
-    /// A5：删文件后清映射 + LRU + 时间戳
+    /// A5: after file deletion, clear mapping + LRU + timestamp
     fn drop_sealed(&mut self, seg_id: u32) {
         self.sealed.remove(&seg_id);
         if let Some(pos) = self.sealed_lru.iter().position(|&s| s == seg_id) {
@@ -138,7 +155,7 @@ impl HandleCache {
     }
 }
 
-/// append-only 向量段池 —— 存原始 f32 向量，fixed dim
+/// Append-only vector segment pool — stores raw f32 vectors, fixed dim
 struct VecSegmentPool {
     data_dir: PathBuf,
     seg_size: u64,
@@ -147,9 +164,11 @@ struct VecSegmentPool {
     active_file: File,
     active_mmap: MmapMut,
     active_cursor: u64,
-    // R1：读侧句柄缓存放 RwLock —— 读路径 vec_slice(&self) 读锁命中缓存（并发无争用），
-    // 未命中升写锁建缓存。写路径 seal_and_rotate 在 RwLock 写锁下升 handles 写锁改缓存。
-    // 锁序恒为 pool RwLock → handles RwLock，单向无环。
+    // R1: read-side handle cache sits inside an RwLock — the read path vec_slice(&self) takes
+    // the read lock and hits the cache (contention-free when concurrent); on a miss it upgrades
+    // to the write lock to build the entry. The write path seal_and_rotate updates the cache
+    // under the pool RwLock write lock and then the handles write lock.
+    // Lock order is always pool RwLock → handles RwLock, one-directional, acyclic.
     handles: RwLock<HandleCache>,
 }
 
@@ -186,8 +205,10 @@ impl VecSegmentPool {
         self.seg_size.saturating_sub(self.active_cursor)
     }
 
-    /// 实际段文件磁盘占用 —— 扫描 vec_data 内所有 .mmap 文件 size 求和。
-    /// P3：含段尾空洞（每段 128MB 预分配，未满段浪费），供 /stats 暴露真实磁盘占用。
+    /// Actual on-disk footprint of segment files — scans all .mmap files in vec_data and sums
+    /// their sizes.
+    /// P3: includes trailing segment holes (each segment is 128MB preallocated; unfilled
+    /// segments waste space), exposing real disk usage via /stats.
     fn disk_bytes(&self) -> Result<u64> {
         let mut total: u64 = 0;
         for entry in std::fs::read_dir(&self.data_dir)? {
@@ -200,7 +221,7 @@ impl VecSegmentPool {
         Ok(total)
     }
 
-    /// 追加一个向量，返回定位信息。写满封存轮转。
+    /// Append one vector, returning its locator. Seals and rotates when full.
     fn append(&mut self, vector: &[f32]) -> Result<ValueLocator> {
         let need = self.byte_len() as u64;
         if need > self.remaining() {
@@ -238,7 +259,8 @@ impl VecSegmentPool {
             hc.sealed_lru.push_back(sealed_id);
             hc.sealed_time.insert(sealed_id, std::time::Instant::now());
             hc.evict();
-            // 轮转后旧 active_read 缓存指向已封存段，失效重建（下次 vec_slice 按需开）
+            // After rotation the old active_read cache points at the now-sealed segment;
+            // invalidate it (reopened lazily by the next vec_slice)
             hc.active_read = None;
         }
         let new_id = sealed_id + 1;
@@ -252,37 +274,46 @@ impl VecSegmentPool {
         Ok(())
     }
 
-    /// 取某 locator 指向的向量字节切片（零拷贝读 mmap，owned Vec）。
-    /// R1：读路径仅持 &self（handles Mutex 内部可变建缓存），不抢 RwLock 写锁。
-    /// 封存段从缓存/按需开；active 段直接读 active_mmap（MAP_SHARED 跨映射一致）。
+    /// Get the vector byte slice a locator points at (zero-copy mmap read, returned as an
+    /// owned Vec).
+    /// R1: the read path only takes &self (handles RwLock interior mutability builds the
+    /// cache) and never grabs the RwLock write lock.
+    /// Sealed segments come from cache / are opened on demand; the active segment reads
+    /// active_mmap directly (MAP_SHARED is consistent across mappings).
     fn read_vec(&self, loc: &ValueLocator) -> Result<Vec<f32>> {
         if loc.seg_id == self.active_id {
-            // active 段：直接读 active_mmap 切片
+            // Active segment: read the active_mmap slice directly
             let start = loc.offset as usize;
             let end = start + self.byte_len();
             let bytes = &self.active_mmap[start..end];
             Ok(bytemuck::cast_slice::<u8, f32>(bytes).to_vec())
         } else {
-            // 封存段：缓存映射读
+            // Sealed segment: read through the cached mapping
             let handle = self.sealed_handle(loc.seg_id)?;
             let bytes = &handle.as_bytes()[loc.offset as usize..(loc.offset + loc.len) as usize];
             Ok(bytemuck::cast_slice::<u8, f32>(bytes).to_vec())
         }
     }
 
-    /// 零拷贝取向量切片 —— 持 Arc<MmapHandle> 保活，返回 ZeroCopyVec（无 Vec 分配）。
-    /// R1：读路径仅持 &self（handles Mutex 建缓存），KNN/compact 读侧经 pool.read() 调此，
-    /// 不再抢 RwLock 写锁 → compact 持写锁做 append 时 KNN 读不再全量阻塞。
-    /// 距离热路径用：NSW 每跳算距离零拷贝读 mmap，不拷贝字节、不分配（H1 零拷贝 + 性能）。
-    /// active 段：包装 active_mmap 的只读 Arc 句柄（MAP_SHARED 跨映射一致，读安全）。
-    /// 封存段：从缓存/按需开只读映射。
+    /// Zero-copy vector slice — holds Arc<MmapHandle> to keep the mapping alive, returns
+    /// ZeroCopyVec (no Vec allocation).
+    /// R1: the read path only takes &self (handles RwLock builds the cache); KNN/compact read
+    /// sides call this via pool.read(), no longer grabbing the RwLock write lock → when compact
+    /// holds the write lock to append, KNN reads are no longer fully blocked.
+    /// Used on the distance hot path: NSW computes distance per hop with zero-copy mmap reads,
+    /// no byte copying, no allocation (H1 zero-copy + performance).
+    /// Active segment: wraps active_mmap in a read-only Arc handle (MAP_SHARED is consistent
+    /// across mappings, safe to read).
+    /// Sealed segments: read-only mapping from cache / opened on demand.
     fn vec_slice(&self, loc: &ValueLocator) -> Result<crate::mem::mmap::ZeroCopyVec> {
         let len = (loc.len as usize) / std::mem::size_of::<f32>();
         let offset = loc.offset as usize;
         if loc.seg_id == self.active_id {
-            // active 段：构造只读 MmapHandle 包装 active_mmap 映射保活。
-            // active 段未 sealed，但 append-only：已写区域永不被改（cursor 单调增），
-            // 故本向量区域零拷贝指针在读期间有效（caller 不持跨下次 append）。
+            // Active segment: build a read-only MmapHandle wrapping the active_mmap mapping to
+            // keep it alive. The active segment is not sealed, but it is append-only: written
+            // regions are never modified (cursor is monotonic), so this vector's zero-copy
+            // pointer stays valid during the read (caller must not hold it across the next
+            // append).
             let handle = self.active_handle()?;
             crate::mem::mmap::ZeroCopyVec::new(handle, offset, len)
         } else {
@@ -291,11 +322,14 @@ impl VecSegmentPool {
         }
     }
 
-    /// active 段只读句柄（供 vec_slice 零拷贝读 active 段）。
-    /// R1：handles RwLock 内部可变建缓存。快路径读锁命中缓存（并发无争用，KNN 热路径无锁开销）；
-    /// 未命中升写锁建只读映射。轮转后失效重建。双映射同文件 MAP_SHARED 字节一致。
+    /// Read-only handle for the active segment (lets vec_slice read the active segment zero-copy).
+    /// R1: cache built via interior mutability inside the handles RwLock. Fast path takes the
+    /// read lock and hits the cache (contention-free, no lock overhead on the KNN hot path);
+    /// on a miss it upgrades to the write lock to build the read-only mapping. Invalidated and
+    /// rebuilt after rotation. Both mappings are MAP_SHARED on the same file, bytes identical.
     fn active_handle(&self) -> Result<Arc<MmapHandle>> {
-        // 快路径：读锁命中（KNN 热路径绝大多数走此，无写锁争用）
+        // Fast path: read lock hit (the overwhelming majority of KNN hot-path calls; no write
+        // lock contention)
         {
             let hc = self
                 .handles
@@ -305,12 +339,12 @@ impl VecSegmentPool {
                 return Ok(h.clone());
             }
         }
-        // 慢路径：未命中，升写锁建缓存
+        // Slow path: miss, upgrade to the write lock to build the cache
         let mut hc = self
             .handles
             .write()
             .map_err(|_| crate::StoreError::LockPoisoned)?;
-        // double-check：升锁期间可能已被另一线程建好
+        // double-check: another thread may have built it while we upgraded the lock
         if let Some(h) = &hc.active_read {
             return Ok(h.clone());
         }
@@ -322,7 +356,7 @@ impl VecSegmentPool {
     }
 
     fn sealed_handle(&self, seg_id: u32) -> Result<Arc<MmapHandle>> {
-        // 快路径：读锁命中（KNN 热路径，并发无争用）
+        // Fast path: read lock hit (KNN hot path, contention-free when concurrent)
         {
             let hc = self
                 .handles
@@ -332,7 +366,7 @@ impl VecSegmentPool {
                 return Ok(h.clone());
             }
         }
-        // 慢路径：未命中，升写锁建映射
+        // Slow path: miss, upgrade to the write lock to build the mapping
         let mut hc = self
             .handles
             .write()
@@ -366,10 +400,12 @@ impl VecSegmentPool {
         Ok(())
     }
 
-    /// 全部段 id（封存 + active）—— compact 记旧段用
+    /// All segment ids (sealed + active) — compact uses this to record old segments
     fn all_seg_ids(&self) -> Vec<u32> {
-        // poison 极罕见；回退仅含 active，宁可漏回收费空间不失正确性。
-        // F-ERR-1：into_inner 恢复毒锁，显式告警供运维感知线程 panic（状态可能不一致）。
+        // Poisoning is extremely rare; the fallback returns only the active segment — better
+        // to miss reclaimable space than to be incorrect.
+        // F-ERR-1: into_inner recovers the poisoned lock, with an explicit warning so operators
+        // notice the thread panic (state may be inconsistent).
         let hc = self.handles.read().unwrap_or_else(|e| {
             tracing::error!("handles lock poisoned in all_seg_ids — recovered via into_inner (compact may miss some sealed segs)");
             e.into_inner()
@@ -379,8 +415,10 @@ impl VecSegmentPool {
         ids
     }
 
-    /// A5：判定段是否可安全回收——封存超 RECLAIM_SAFETY OR strong_count==1（无 reader 持）。
-    /// 不在缓存中的段（已淘汰/从未开）按 strong_count 缺省视作可回收（无活跃 Arc）。
+    /// A5: decide whether a segment is safe to reclaim — sealed longer than RECLAIM_SAFETY OR
+    /// strong_count==1 (no readers).
+    /// Segments not in the cache (evicted / never opened) default to reclaimable by
+    /// strong_count (no live Arc).
     fn reclaim_safe(&self, seg_id: u32) -> bool {
         let hc = self
             .handles
@@ -404,9 +442,11 @@ impl VecSegmentPool {
         }
     }
 
-    /// A5：从缓存移除已回收段（删文件后清映射 + LRU + 时间戳）
+    /// A5: remove a reclaimed segment from the cache (after file deletion, clear mapping + LRU
+    /// + timestamp)
     fn drop_sealed(&mut self, seg_id: u32) {
-        // F-ERR-1：into_inner 恢复毒锁，显式告警（写锁中毒 = 有线程在改 handles 时 panic）。
+        // F-ERR-1: into_inner recovers the poisoned lock with an explicit warning (a poisoned
+        // write lock = some thread panicked while mutating handles).
         let mut hc = self.handles.write().unwrap_or_else(|e| {
             tracing::error!(
                 seg_id,
@@ -422,8 +462,10 @@ fn vec_segment_file(seg_id: u32) -> String {
     format!("vec_payload_{:04}.mmap", seg_id)
 }
 
-/// 从 heed 加载全部 id→locator 进内存缓存（open/reopen 调用，热路径免 heed）。
-/// 16B/项元数据（非向量字节，向量仍在 mmap 段，H1）。1M 规模约 16MB，可接受。
+/// Load all id→locator entries from heed into the in-memory cache (called at open/reopen,
+/// sparing the hot path from heed).
+/// 16B per entry of metadata (not vector bytes; vectors stay in mmap segments, H1). ~16MB at
+/// 1M vectors — acceptable.
 fn load_locator_cache(
     env: &Env,
     locator_db: &Database<Bytes, Bytes>,
@@ -472,20 +514,24 @@ fn open_or_create_vec_segment(path: &Path, size: u64) -> Result<File> {
     Ok(file)
 }
 
-/// R2 guard：校验磁盘可用空间 ≥ needed，不足则显式报错。
-/// compact 峰值约需当前向量段总占用的新空间（新段写活向量）；若磁盘满，
-/// append 中途 ENOSPC → 半写段 + locator 未切 → 不一致。预检防此，显式失败不静默吞。
+/// R2 guard: verify at least `needed` disk space is available, failing explicitly otherwise.
+/// compact's peak needs roughly the current total vector-segment footprint in new space (live
+/// vectors written to new segments); if the disk fills, mid-append ENOSPC → half-written
+/// segment + locator not switched → inconsistency. This precheck prevents that, failing
+/// explicitly instead of silently swallowing.
 fn ensure_disk_available(dir: &Path, needed: u64) -> Result<()> {
     #[cfg(unix)]
     {
         use std::ffi::CString;
         use std::os::unix::ffi::OsStrExt;
-        // statvfs 取目录所在卷可用空间
+        // statvfs gets the free space of the volume holding the directory
         let cdir = CString::new(dir.as_os_str().as_bytes())
             .map_err(|e| crate::StoreError::Corrupt(format!("path cstring: {}", e)))?;
-        // F-SEC-6：statvfs 是 POD（全数值字段，无指针/union/Drop），std::mem::zeroed() 安全——
-        // libc::statvfs(cdir, &mut statv) 整体覆写全部字段，zeroed 仅占位未初始化内存。
-        // 零初始化的 statvfs 无非法指针/null 引用可解引用（f_fsid 是数组非指针），故无 UB。
+        // F-SEC-6: statvfs is POD (all numeric fields, no pointers/unions/Drop), so
+        // std::mem::zeroed() is safe — libc::statvfs(cdir, &mut statv) overwrites every field
+        // wholesale; zeroed is just placeholder uninitialized memory.
+        // A zero-initialized statvfs has no illegal pointer/null reference to dereference
+        // (f_fsid is an array, not a pointer), so there is no UB.
         let mut statv: libc::statvfs = unsafe { std::mem::zeroed() };
         let rc = unsafe { libc::statvfs(cdir.as_ptr(), &mut statv) };
         if rc != 0 {
@@ -514,25 +560,28 @@ fn ensure_disk_available(dir: &Path, needed: u64) -> Result<()> {
     Ok(())
 }
 
-/// 向量索引 —— vec mmap 段 + heed locator + NSW 图常驻 RAM
+/// Vector index — vec mmap segments + heed locator + NSW graph resident in RAM
 pub struct VectorIndex {
     schema: VectorSchema,
     env: Env,
     locator_db: Database<Bytes, Bytes>,
     pool: RwLock<VecSegmentPool>,
     graph: RwLock<NswGraph>,
-    // locator 内存缓存 —— id→ValueLocator（16B/项，元数据非向量字节）。
-    // 热路径距离闭包按 id 取 locator，免 heed read_txn + serde 反序列化（性能）。
-    // 向量数据仍存 mmap 段非 RAM（H1）；仅缓存定位元数据（非 PRD 约束的向量字节）。
+    // locator in-memory cache — id→ValueLocator (16B/entry, metadata not vector bytes).
+    // The hot-path distance closure fetches locators by id, avoiding heed read_txn + serde
+    // deserialization (performance).
+    // Vector data still lives in mmap segments, not RAM (H1); only location metadata is cached
+    // (not the vector bytes the PRD constrains).
     locators: RwLock<HashMap<u64, ValueLocator>>,
-    // R6：距离闭包读向量失败时置位（闭包签名返回 f32 无法回传 Result）。
-    // search_knn 遍历后检查此标志 → Err(Corrupt)，不静默吞读取错。
+    // R6: set when the distance closure fails to read a vector (the closure signature returns
+    // f32 and cannot propagate a Result). search_knn checks this flag after traversal →
+    // Err(Corrupt), instead of silently swallowing read errors.
     read_error: Arc<AtomicBool>,
 }
 
 impl VectorIndex {
-    /// 新建/打开向量索引。
-    /// ns_dir/{data,meta}：data 放 vec 段，meta 放 heed。
+    /// Create/open a vector index.
+    /// ns_dir/{data,meta}: data holds vec segments, meta holds heed.
     pub fn open(ns_dir: &Path, schema: VectorSchema, seg_size: u64) -> Result<Self> {
         let data_dir = ns_dir.join("vec_data");
         let meta_dir = ns_dir.join("vec_meta");
@@ -541,13 +590,14 @@ impl VectorIndex {
             EnvOpenOptions::new()
                 .map_size(VEC_META_MAP_SIZE)
                 .max_dbs(crate::HEED_MAX_DBS)
-                // NO_SYNC：locator 元数据 commit 不 fsync；WAL 唯一同步点（H5）
+                // NO_SYNC: locator metadata commits are not fsynced; the WAL is the only sync
+                // point (H5)
                 .flags(heed::EnvFlags::NO_SYNC)
                 .open(&meta_dir)?
         };
         let mut wtxn = env.write_txn()?;
         let locator_db = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(VEC_LOCATOR_DB))?;
-        // 持久化 schema（恢复时读回）
+        // Persist the schema (read back on recovery)
         let schema_bytes = serde_json::to_vec(&schema)?;
         let schema_db = env
             .database_options()
@@ -556,9 +606,10 @@ impl VectorIndex {
         schema_db.put(&mut wtxn, SCHEMA_KEY, &schema_bytes)?;
         wtxn.commit()?;
         let pool = VecSegmentPool::open(&data_dir, seg_size, schema.dim)?;
-        // 从 snapshot 段重载图拓扑到 RAM（H1）；无 snapshot 则新图
+        // Reload graph topology from the snapshot segment into RAM (H1); fresh graph if absent
         let graph = crate::vector::snapshot::load(&data_dir)?.unwrap_or_else(NswGraph::new);
-        // 加载 locator 内存缓存（从 heed 读回全部 id→locator），热路径距离闭包免每跳 heed
+        // Load the locator in-memory cache (all id→locator read back from heed) so the
+        // hot-path distance closure avoids per-hop heed reads
         let locators = load_locator_cache(&env, &locator_db)?;
         tracing::info!(
             dim = schema.dim,
@@ -582,8 +633,9 @@ impl VectorIndex {
         &self.schema
     }
 
-    /// 重开已存在的向量索引（从 heed 读回建库时锁定的 schema）[v2 E2]
-    /// FFI/CLI 无 schema 入参时用此；schema 未持久化则报 Corrupt。
+    /// Reopen an existing vector index (reads the schema locked at creation back from heed) [v2 E2]
+    /// Used by FFI/CLI when no schema argument is available; reports Corrupt if no schema was
+    /// persisted.
     pub fn reopen(ns_dir: &Path, seg_size: u64) -> Result<Self> {
         let data_dir = ns_dir.join("vec_data");
         let meta_dir = ns_dir.join("vec_meta");
@@ -591,11 +643,12 @@ impl VectorIndex {
             EnvOpenOptions::new()
                 .map_size(VEC_META_MAP_SIZE)
                 .max_dbs(crate::HEED_MAX_DBS)
-                // NO_SYNC：locator 元数据 commit 不 fsync；WAL 唯一同步点（H5）
+                // NO_SYNC: locator metadata commits are not fsynced; the WAL is the only sync
+                // point (H5)
                 .flags(heed::EnvFlags::NO_SYNC)
                 .open(&meta_dir)?
         };
-        // 读回持久化 schema（建库时落 SCHEMA_KEY）
+        // Read back the persisted schema (written under SCHEMA_KEY at creation)
         let schema = {
             let rtxn = env.read_txn()?;
             let schema_db = env
@@ -610,14 +663,16 @@ impl VectorIndex {
             };
             serde_json::from_slice::<VectorSchema>(schema_bytes)?
         };
-        // locator_db 可能已存在，用 create_database 幂等取句柄
+        // locator_db may already exist; create_database idempotently fetches the handle
         let mut wtxn = env.write_txn()?;
         let locator_db = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(VEC_LOCATOR_DB))?;
         wtxn.commit()?;
         let pool = VecSegmentPool::open(&data_dir, seg_size, schema.dim)?;
-        // E4：snapshot 加载失败（CRC 损坏/悬边/截断）不致命——丢弃坏 snapshot，
-        // 回落到空图，交由下方 count-compare 检测 graph<locator 触发从数据重建图。
-        // 坏 snapshot 已是损坏态，重建是唯一安全恢复路径（绝不加载坏图）。
+        // E4: a snapshot load failure (CRC corruption/dangling edge/truncation) is not fatal —
+        // discard the bad snapshot, fall back to an empty graph, and let the count-compare
+        // below detect graph<locator and trigger a rebuild from data.
+        // A bad snapshot is already a corrupted state; rebuilding is the only safe recovery
+        // path (never load a bad graph).
         let graph = match crate::vector::snapshot::load(&data_dir) {
             Ok(Some(g)) => g,
             Ok(None) => NswGraph::new(),
@@ -643,8 +698,9 @@ impl VectorIndex {
             locators: RwLock::new(locators),
             read_error: Arc::new(AtomicBool::new(false)),
         };
-        // 崩溃恢复：snapshot 缺/过期致图节点 < locator 数 → 从持久化数据重建图
-        // （NSW 图仅 RAM，无 checkpoint 即丢；locator+向量字节已落 mmap 段+heed）
+        // Crash recovery: a missing/stale snapshot leaves graph nodes < locator count →
+        // rebuild the graph from persisted data (the NSW graph is RAM-only and lost without a
+        // checkpoint; locator + vector bytes are already durable in mmap segments + heed)
         let graph_nodes = idx
             .graph
             .read()
@@ -670,7 +726,7 @@ impl VectorIndex {
         let key = id.to_le_bytes();
         let val = serde_json::to_vec(loc)?;
         self.locator_db.put(wtxn, &key, &val)?;
-        // 同步内存缓存（热路径免 heed）
+        // Keep the in-memory cache in sync (saves heed on the hot path)
         self.locators
             .write()
             .map_err(|_| crate::StoreError::LockPoisoned)?
@@ -690,19 +746,22 @@ impl VectorIndex {
         }
     }
 
-    /// 取某 id 的零拷贝向量切片（公开内部用，read_vec 的零拷贝替代）。
-    /// compact 重建图时用 live_map（内存），不走此；此处留供测试/调试。
+    /// Get a zero-copy vector slice by id (internal use; the zero-copy alternative to read_vec).
+    /// compact's graph rebuild uses live_map (in memory) instead; kept for tests/debugging.
     #[allow(dead_code)]
     fn vec_of_slice(&self, id: u64) -> Result<crate::mem::mmap::ZeroCopyVec> {
         self.vec_slice(id)
     }
 
-    /// 零拷贝取某 id 的向量切片（读 mmap 段，持 Arc<MmapHandle> 保活）。
-    /// 图距离闭包热路径用：免 heed read_txn + serde 反序列化 + Vec 分配（性能 + H1 零拷贝）。
-    /// locator 从内存缓存取（未命中回退 heed 读并补缓存）。
+    /// Zero-copy vector slice by id (reads the mmap segment, holding Arc<MmapHandle> to keep
+    /// it alive).
+    /// Used by the graph distance-closure hot path: skips heed read_txn + serde
+    /// deserialization + Vec allocation (performance + H1 zero-copy).
+    /// The locator comes from the in-memory cache (on miss, falls back to heed and backfills).
     fn vec_slice(&self, id: u64) -> Result<crate::mem::mmap::ZeroCopyVec> {
         let loc = {
-            // 先查内存缓存（无锁争用热路径）；未命中回退 heed + 补缓存
+            // Check the in-memory cache first (contention-free hot path); fall back to heed
+            // + backfill on miss
             let cache = self
                 .locators
                 .read()
@@ -712,7 +771,8 @@ impl VectorIndex {
         let loc = match loc {
             Some(l) => l,
             None => {
-                // 缓存未命中：回退 heed 读 + 补缓存（罕见：重开后旧 id 未加载？理论全覆盖）
+                // Cache miss: fall back to a heed read + backfill (rare: an old id not loaded
+                // after reopen? theoretically fully covered)
                 let txn = self.env.read_txn()?;
                 let l = self
                     .get_locator(&txn, id)?
@@ -732,10 +792,11 @@ impl VectorIndex {
         pool.vec_slice(&loc)
     }
 
-    /// 距离闭包：查询向量到某 id 节点的距离。
-    /// search_knn 用，按 id 零拷贝读向量算距离（ZeroCopyVec 无分配）。
-    /// R6：读向量失败时置 read_error 标志 + 返回 INFINITY（让遍历继续不 panic），
-    /// search_knn 遍历后查标志转 Err(Corrupt) —— 不静默吞坏读。
+    /// Distance closure: distance from the query vector to a given node id.
+    /// Used by search_knn; reads vectors zero-copy by id (ZeroCopyVec, no allocation).
+    /// R6: on a vector read failure, set the read_error flag and return INFINITY (keeps
+    /// traversal going without panicking); search_knn checks the flag after traversal and
+    /// converts it to Err(Corrupt) — bad reads are never silently swallowed.
     fn make_query_dist<'a>(&'a self, query: &'a [f32]) -> impl Fn(u64) -> f32 + 'a {
         let err_flag = Arc::clone(&self.read_error);
         move |id| {
@@ -758,7 +819,8 @@ impl VectorIndex {
         _timeout: Option<std::time::Duration>,
     ) -> Result<()> {
         self.schema.validate_dim(vector)?;
-        // locator 写入用 wtxn（id 唯一性：重复 put_kv 覆盖，向量 id 重复报错）
+        // locator write uses wtxn (id uniqueness: duplicate put_kv overwrites, duplicate vector
+        // ids error out)
         let mut wtxn = self.env.write_txn()?;
         if self.get_locator(&wtxn, id)?.is_some() {
             wtxn.abort();
@@ -772,14 +834,14 @@ impl VectorIndex {
         self.put_locator(&mut wtxn, id, &loc)?;
         wtxn.commit()?;
         drop(pool);
-        // 图连边：dist 闭包零拷贝读现存向量算距离
+        // Graph edge building: the dist closure reads existing vectors zero-copy for distances
         let mut graph = self
             .graph
             .write()
             .map_err(|_| crate::StoreError::LockPoisoned)?;
         let query = vector.to_vec();
         let dist = move |nid: u64| {
-            // 连边距离 = 新向量到现存节点向量（零拷贝读 mmap）
+            // Edge distance = new vector to existing node vector (zero-copy mmap read)
             let v = match self.vec_slice(nid) {
                 Ok(v) => v,
                 Err(_) => return f32::INFINITY,
@@ -800,7 +862,7 @@ impl VectorIndex {
             self.schema.validate_dim(vec)?;
         }
         let mut wtxn = self.env.write_txn()?;
-        // 唯一性预检
+        // Uniqueness precheck
         for (id, _) in items {
             if self.get_locator(&wtxn, *id)?.is_some() {
                 wtxn.abort();
@@ -819,12 +881,16 @@ impl VectorIndex {
         }
         wtxn.commit()?;
         drop(pool);
-        // 批量连边 —— dist 闭包零拷贝读 mmap 算距离（免 O(N) 预取全图入 RAM）。
-        // 旧实现每批 rescan 全部 N 旧向量入 live_map → O(N²) 拷贝，1M 规模不可行。
-        // 新实现：现存节点经 vec_slice(id) 零拷贝读 mmap（locator 内存缓存免 heed），
-        //         本批新向量已 append 落段 + locator 入缓存，同样 vec_slice 可读。
-        // 锁顺序 graph.write → vec_slice→pool.write：与 insert（pool 写后释放再 graph 写，
-        // 不嵌套）不冲突，与 search_knn（graph.read → vec_slice→pool.write）一致序，无死锁。
+        // Batch edge building — the dist closure reads mmap zero-copy for distances (avoids
+        // O(N) prefetching of the whole graph into RAM).
+        // The old implementation rescanned all N old vectors into live_map per batch → O(N²)
+        // copies, infeasible at 1M scale.
+        // New implementation: existing nodes are read zero-copy via vec_slice(id) (the locator
+        // in-memory cache skips heed); this batch's new vectors are already appended to
+        // segments with locators cached, so vec_slice reads them too.
+        // Lock order graph.write → vec_slice→pool.write: compatible with insert (pool write
+        // released before graph write, no nesting) and same-ordered as search_knn
+        // (graph.read → vec_slice→pool.write), no deadlock.
         let mut graph = self
             .graph
             .write()
@@ -849,7 +915,7 @@ impl VectorIndex {
     ) -> Result<Vec<(u64, f32)>> {
         self.schema.validate_dim(query)?;
         let deadline = timeout.map(|t| std::time::Instant::now() + t);
-        // R6：每次搜索前清读取错标志
+        // R6: clear the read-error flag before every search
         self.read_error.store(false, Ordering::Release);
         let graph = self
             .graph
@@ -857,7 +923,8 @@ impl VectorIndex {
             .map_err(|_| crate::StoreError::LockPoisoned)?;
         let dist = self.make_query_dist(query);
         let found = graph.search_knn(&dist, top_k, self.schema.ef_search, deadline)?;
-        // R6：遍历中有坏读 → 显式报错，不返回静默丢节点的结果
+        // R6: bad reads during traversal → fail explicitly, never return results that silently
+        // dropped nodes
         if self.read_error.load(Ordering::Acquire) {
             tracing::error!("knn completed but vector read errors occurred — result unreliable");
             return Err(crate::StoreError::Corrupt(
@@ -873,7 +940,8 @@ impl VectorIndex {
             .write()
             .map_err(|_| crate::StoreError::LockPoisoned)?;
         let removed = graph.delete(id);
-        // locator 不删（向量字节 M4 compact 回收）；图软删即生效
+        // locator is not deleted (vector bytes reclaimed by M4 compact); the graph soft delete
+        // takes effect immediately
         tracing::info!(id, removed, "vector soft-deleted");
         Ok(removed)
     }
@@ -886,8 +954,9 @@ impl VectorIndex {
             .unwrap_or(0)
     }
 
-    // 图常驻 RAM 字节（NSW 拓扑，向量数据在 mmap 段非 RAM）。
-    // §776 #9 >10M 分层加载评估基建：经 /stats 暴露，未来按实际占用决策。
+    // Graph RAM-resident bytes (NSW topology; vector data lives in mmap segments, not RAM).
+    // §776 #9 >10M tiered-loading infra assessment: exposed via /stats so future decisions can
+    // use real footprint.
     pub fn graph_memory_usage(&self) -> usize {
         self.graph
             .read()
@@ -900,11 +969,12 @@ impl VectorIndex {
         self.len() == 0
     }
 
-    /// 按 id 取单向量（owned Vec<f32>）。id 不存在或已软删 → None。
-    /// 消费方（fusion-memory retrieve_context 兜底 + reconcile 审计）需要 #3。
+    /// Get a single vector by id (owned Vec<f32>). Returns None for absent or soft-deleted ids.
+    /// Needed by consumers (fusion-memory retrieve_context fallback + reconcile audit, #3).
     pub fn get_vector(&self, id: u64) -> Result<Option<Vec<f32>>> {
-        // graph 读锁校验存在性 + 软删：is_deleted 对不存在 id 返回 true（见 nsw.rs）。
-        // 不存在或已软删 → None（不暴露 tombstone 向量）。
+        // Graph read lock validates existence + soft delete: is_deleted returns true for
+        // absent ids (see nsw.rs).
+        // Absent or soft-deleted → None (tombstone vectors are never exposed).
         let deleted = {
             let graph = self
                 .graph
@@ -920,7 +990,8 @@ impl VectorIndex {
         Ok(Some(v.as_f32().to_vec()))
     }
 
-    /// 枚举所有存活（非软删）向量 id。消费方（fusion-memory consolidate 审计）需要 #3。
+    /// Enumerate all live (non-soft-deleted) vector ids. Needed by consumers
+    /// (fusion-memory consolidate audit, #3).
     pub fn list_vector_ids(&self) -> Result<Vec<u64>> {
         let graph = self
             .graph
@@ -931,8 +1002,10 @@ impl VectorIndex {
         Ok(ids)
     }
 
-    /// 向量段实际磁盘占用（P3：含段尾空洞，对比向量 payload 净字节）。
-    /// 向量无净 payload 配额（向量不进 KV/列式配额计数），此值纯监控用。
+    /// Actual on-disk footprint of vector segments (P3: includes trailing segment holes,
+    /// compare against net vector payload bytes).
+    /// Vectors have no net-payload quota (vectors are not counted in KV/columnar quotas); this
+    /// value is purely for monitoring.
     pub fn disk_bytes(&self) -> Result<u64> {
         let pool = self
             .pool
@@ -941,7 +1014,7 @@ impl VectorIndex {
         pool.disk_bytes()
     }
 
-    /// 取向量数据目录路径快照（compact 磁盘预检 guard 用）
+    /// Snapshot the vector data directory path (used by the compact disk precheck guard)
     fn data_dir_via_pool(&self) -> PathBuf {
         let pool = self
             .pool
@@ -953,7 +1026,8 @@ impl VectorIndex {
         }
     }
 
-    /// checkpoint：图拓扑 snapshot 落单 mmap 段 + 段 flush（H1 持久化）
+    /// checkpoint: snapshot graph topology into a single mmap segment + flush segments
+    /// (H1 persistence)
     pub fn checkpoint(&self) -> Result<()> {
         let graph = self
             .graph
@@ -961,8 +1035,8 @@ impl VectorIndex {
             .map_err(|_| crate::StoreError::LockPoisoned)?;
         let bytes = crate::vector::snapshot::serialize(&graph);
         let data_dir = {
-            // data_dir = ns_dir/data；pool 持有，但 snapshot 文件存 data_dir
-            // 用 pool.data_dir 字段——读锁取路径快照
+            // data_dir = ns_dir/data; owned by the pool, but the snapshot file lives in data_dir.
+            // Use the pool.data_dir field — take the path snapshot under the read lock.
             let pool = self
                 .pool
                 .read()
@@ -979,24 +1053,34 @@ impl VectorIndex {
         Ok(())
     }
 
-    /// 崩溃恢复：从持久化 locator + 向量字节重建 NSW 图 [v2 H1/R2/F2 修复]。
+    /// Crash recovery: rebuild the NSW graph from persisted locators + vector bytes
+    /// [v2 H1/R2/F2 fix].
     ///
-    /// NSW 图常驻 RAM，仅 checkpoint 时 snapshot 落盘。崩溃（无 checkpoint）后
-    /// reopen → 图为空，但 locator + 向量字节已在 mmap 段 + heed（WAL 重放已落）。
-    /// 此法扫全部 locator 读回向量，按内存 live_map 重建图拓扑（同 compact 重建路径）。
+    /// The NSW graph is RAM-resident and only snapshotted at checkpoint time. After a crash
+    /// (without a checkpoint) reopen → the graph is empty, but locator + vector bytes are
+    /// already durable in mmap segments + heed (replayed by the WAL). This method scans all
+    /// locators, reads vectors back, and rebuilds the graph topology from an in-memory
+    /// live_map (same rebuild path as compact).
     ///
-    /// 调用时机：reopen 时 graph_nodes < locator 数（snapshot 缺/过期）。
-    /// 软删 id：恢复后图无 deleted 标记，caller（Engine recover）重放 DeleteVector 重新软删。
+    /// Trigger: at reopen, graph_nodes < locator count (snapshot missing/stale).
+    /// Soft-deleted ids: the rebuilt graph carries no deleted flags; the caller (Engine
+    /// recover) replays DeleteVector to re-soft-delete them.
     ///
-    /// A3 已知限制（honest+guard，非增量图边 WAL）：重建为 O(N·ef·M) 全量重连，
-    /// 超大规模（5M+）崩溃恢复耗时可达小时级。WAL 仅记向量 payload，不记图边增量，
-    /// 故崩溃于两 checkpoint 间 → 须从数据重建图（无增量可重放）。R1 已解「恢复持写锁
-    /// 全量阻塞」——重建期间持读锁，KNN 可并发（虽返回的是重建中的图，最终一致）。
-    /// guard：仅 graph<locator 时触发（已检）；频繁 checkpoint 缩短崩溃窗口（降重建概率）。
-    /// 增量图边持久化（边 delta 入 WAL）为后续演进项，当前以诚实文档 + 触发守卫兜底。
+    /// A3 known limitation (honest + guarded, not incremental graph-edge WAL): rebuild is a
+    /// full O(N·ef·M) relink; at very large scale (5M+) crash recovery can take hours. The WAL
+    /// records only vector payloads, not graph-edge deltas, so a crash between two checkpoints
+    /// forces a rebuild from data (no incremental replay). R1 already fixed "recovery holds the
+    /// write lock and blocks everything" — during the rebuild it holds the read lock and KNN
+    /// can proceed concurrently (serving the in-progress graph, eventually consistent).
+    /// Guard: triggered only when graph<locator (already checked); frequent checkpoints shrink
+    /// the crash window (lowering rebuild probability).
+    /// Incremental graph-edge persistence (edge deltas into the WAL) is a future evolution
+    /// item; for now, honest documentation plus the trigger guard covers it.
     fn rebuild_graph_from_data(&self) -> Result<()> {
-        // A3 guard：记录重建规模 + 成本告警。超大规模（>100K）全量重建 O(N·ef·M) 耗时可观，
-        // 提示运维这是已知限制（增量图边 WAL 待演进）；R1 已保证不持写锁阻塞服务。
+        // A3 guard: record rebuild scale + cost warning. Full rebuild at very large scale
+        // (>100K) is O(N·ef·M) and can take considerable time; operators are reminded this is
+        // a known limitation (incremental graph-edge WAL pending); R1 already guarantees no
+        // write lock blocks service.
         let warn_count = self.locators.read().map(|c| c.len()).unwrap_or(0);
         if warn_count > 100_000 {
             tracing::warn!(
@@ -1007,11 +1091,12 @@ impl VectorIndex {
         } else {
             tracing::info!(count = warn_count, "rebuild graph from data (small scale)");
         }
-        // 扫全部 locator 读回向量（pool.read_vec 零拷贝读 mmap 段）
+        // Scan all locators and read vectors back (pool.read_vec zero-copy reads the mmap segments)
         let live: Vec<(u64, Vec<f32>)> = {
             let txn = self.env.read_txn()?;
-            // R1：read_vec 现取 &self → 持读锁扫描，KNN 读路径（graph.read→vec_slice→pool.read）
-            // 在此扫描期间仍可并发服务，不被恢复阻塞。
+            // R1: read_vec now takes &self → the scan holds the read lock, so KNN read paths
+            // (graph.read→vec_slice→pool.read) can keep serving concurrently during the scan,
+            // unblocked by recovery.
             let pool = self
                 .pool
                 .read()
@@ -1040,7 +1125,7 @@ impl VectorIndex {
             }
             g
         };
-        // 切内存图
+        // Swap in the in-memory graph
         {
             let mut graph = self
                 .graph
@@ -1055,22 +1140,32 @@ impl VectorIndex {
         Ok(())
     }
 
-    /// compact COW 原子切换 [v2 A3/H4]：重排有效向量到新段 + 重建图 + 原子切 heed。
-    /// 新向量追加到当前 pool 的更高 seg_id（COW：不动旧段字节，旧段不可变 H4）。
-    /// 单 heed 写事务原子切 locator 指向新段 → 旧段无新 reader 引用 → 延迟回收。
+    /// compact COW atomic switch [v2 A3/H4]: reshuffle live vectors into new segments +
+    /// rebuild the graph + atomically switch heed.
+    /// New vectors are appended to the current pool at higher seg_ids (COW: old segment bytes
+    /// are untouched, old segments immutable — H4).
+    /// A single heed write transaction atomically switches locators to the new segments →
+    /// old segments gain no new readers → deferred reclaim.
     ///
-    /// R1：读路径（扫描/vec_slice）现持 RwLock 读锁，KNN 在 compact 的扫描与图重建
-    /// 阶段并发服务；仅 step3 append（O(N) 字节，秒级）短暂持写锁。audit R1「compact
-    /// 持写锁做读+重写，期间全量向量读阻塞」已解 —— 阻塞窗口从小时级降到秒级。
+    /// R1: read paths (scan/vec_slice) now hold the RwLock read lock, so KNN is served
+    /// concurrently during compact's scan and graph-rebuild phases; only step3 append
+    /// (O(N) bytes, seconds) briefly holds the write lock. The audit R1 finding "compact holds
+    /// the write lock while reading + rewriting, blocking all vector reads" is fixed — the
+    /// blocking window drops from hours to seconds.
     ///
-    /// R2 已知限制（honest+guard，非增量重写）：compact 为全量重写活向量到新段，
-    /// 新旧段短暂共存 → 磁盘峰值约 2× 当前向量段占用（旧段延迟回收前双份）。
-    /// 图重建为 O(N·ef·M)（不持锁，KNN 可并发），超大规模（5M+）耗时仍可观 ——
-    /// 增量段级回收（只重写含软删的段）为后续演进项，当前以磁盘预检 guard 防 ENOSPC
-    /// 致中途崩溃（写一半磁盘满 = 半写段 + locator 不一致）。预检失败显式报错，不静默吞。
-    /// 返回 (待回收旧段 id 集, 活向量数)。
+    /// R2 known limitation (honest + guarded, not incremental rewrite): compact rewrites all
+    /// live vectors into new segments; old and new coexist briefly → disk peaks at ~2× the
+    /// current vector-segment footprint (duplicated until old segments are reclaimed).
+    /// Graph rebuild is O(N·ef·M) (lock-free, KNN can proceed concurrently); at very large
+    /// scale (5M+) it still takes considerable time — incremental segment-level reclaim
+    /// (rewriting only segments containing soft deletes) is a future evolution item; for now a
+    /// disk precheck guard prevents ENOSPC-induced mid-run crashes (disk filling halfway =
+    /// half-written segment + locator inconsistency). A failed precheck errors out explicitly,
+    /// never silently swallowed.
+    /// Returns (set of old segment ids pending reclaim, live vector count).
     pub fn compact(&self) -> Result<(Vec<u32>, usize)> {
-        // 1. 记旧段 id（compact 前全部 seg）—— 切换后这些段待回收
+        // 1. Record old segment ids (all segments before compact) — these await reclaim after
+        // the switch
         let old_seg_ids: Vec<u32> = {
             let pool = self
                 .pool
@@ -1078,8 +1173,10 @@ impl VectorIndex {
                 .map_err(|_| crate::StoreError::LockPoisoned)?;
             pool.all_seg_ids()
         };
-        // R2 guard：磁盘预检。compact 峰值需 ~1 段新空间（活向量追加，最多开新段）。
-        // 当前向量段总占用即峰值新增上界；不足则显式报错，免 append 中途 ENOSPC 半写。
+        // R2 guard: disk precheck. compact's peak needs ~1 segment of new space (live vectors
+        // appended, at most one new segment opened).
+        // The current total vector-segment footprint is the upper bound on the peak delta; if
+        // insufficient, fail explicitly rather than hit ENOSPC mid-append with a half write.
         let peak_needed = {
             let pool = self
                 .pool
@@ -1088,9 +1185,11 @@ impl VectorIndex {
             pool.disk_bytes()?
         };
         ensure_disk_available(&self.data_dir_via_pool(), peak_needed)?;
-        // 2. 扫全部 locator，读回向量，过滤软删。
-        // R1：read_vec 现取 &self → 扫描持读锁，KNN 读在此期间并发服务（仅 step3 append 短暂持写锁）。
-        // 锁顺序：先 graph.read 取软删 id 集（释放），再 pool.read 读向量——不嵌套写锁。
+        // 2. Scan all locators, read vectors back, filter soft deletes.
+        // R1: read_vec now takes &self → the scan holds the read lock, KNN reads are served
+        // concurrently during it (only step3 append briefly holds the write lock).
+        // Lock order: first graph.read to take the soft-deleted id set (released), then
+        // pool.read to read vectors — no nested write locks.
         let live: Vec<(u64, Vec<f32>)> = {
             let deleted: std::collections::HashSet<u64> = {
                 let graph = self
@@ -1119,7 +1218,7 @@ impl VectorIndex {
         };
         let live_count = live.len();
         let metric = self.schema.metric;
-        // 3. 追加活向量到当前 pool（更高 seg_id，新段）
+        // 3. Append live vectors to the current pool (higher seg_ids, new segments)
         let new_locs: Vec<(u64, ValueLocator)> = {
             let mut pool = self
                 .pool
@@ -1133,7 +1232,8 @@ impl VectorIndex {
             pool.flush()?;
             locs
         };
-        // 4. 重建 NSW 图：dist 闭包用内存活向量 map 算距离（不重读段，无并发）
+        // 4. Rebuild the NSW graph: the dist closure uses the in-memory live-vector map for
+        // distances (no segment re-reads, no concurrency)
         let live_map: HashMap<u64, Vec<f32>> = live.into_iter().collect();
         let new_graph = {
             let mut g = NswGraph::new();
@@ -1150,7 +1250,7 @@ impl VectorIndex {
             live = live_count,
             "compact: vectors rewritten to new segs + graph rebuilt"
         );
-        // 5. 原子切 heed locator：单写事务清旧 + 写新
+        // 5. Atomically switch heed locators: one write transaction clears old + writes new
         {
             let mut wtxn = self.env.write_txn()?;
             let mut stale_keys = Vec::new();
@@ -1166,7 +1266,7 @@ impl VectorIndex {
             }
             wtxn.commit()?;
         }
-        // 6. 内存图切换为新图
+        // 6. Swap the in-memory graph for the new one
         {
             let mut graph = self
                 .graph
@@ -1174,8 +1274,9 @@ impl VectorIndex {
                 .map_err(|_| crate::StoreError::LockPoisoned)?;
             *graph = new_graph;
         }
-        // 6.1 重建 locator 内存缓存 —— compact 删了软删 id 的 locator，旧缓存过期。
-        // 直接以新活向量 locator 集替换缓存（避免读到已回收旧段）。
+        // 6.1 Rebuild the locator in-memory cache — compact deleted locators of soft-deleted
+        // ids, so the old cache is stale. Replace it wholesale with the new live-vector
+        // locator set (avoids reading already-reclaimed old segments).
         {
             let mut cache = self
                 .locators
@@ -1186,7 +1287,7 @@ impl VectorIndex {
                 cache.insert(*id, *loc);
             }
         }
-        // 7. dump 新 snapshot
+        // 7. Dump the new snapshot
         let data_dir = {
             let pool = self
                 .pool
@@ -1208,11 +1309,14 @@ impl VectorIndex {
         Ok((old_seg_ids, live_count))
     }
 
-    /// 待回收旧段文件物理删除 [v2 A3 延迟回收 + A5 安全期强制]
-    /// compact 后 caller 持旧 seg_ids，调此删文件。A5：删前校验安全期——
-    /// 封存超 RECLAIM_SAFETY OR strong_count==1（无 in-flight reader）才删；
-    /// 不满足则跳过该段（保留文件），caller 可稍后再调。免删仍被零拷贝读的段致 UAF。
-    /// 返回已回收段数。
+    /// Physically delete old segment files pending reclaim [v2 A3 deferred reclaim + A5
+    /// safety-period enforcement]
+    /// After compact, the caller holds the old seg_ids and calls this to delete the files.
+    /// A5: the safety period is verified before deletion — a file is deleted only if sealed
+    /// longer than RECLAIM_SAFETY OR strong_count==1 (no in-flight readers); otherwise that
+    /// segment is skipped (file kept) and the caller may retry later. Prevents deleting
+    /// segments still being read zero-copy (UAF).
+    /// Returns the number of reclaimed segments.
     pub fn reclaim_segments(&self, seg_ids: &[u32]) -> Result<usize> {
         let data_dir = {
             let pool = self
@@ -1224,7 +1328,7 @@ impl VectorIndex {
         let mut reclaimed = 0usize;
         let mut unsafe_ids = Vec::new();
         for &sid in seg_ids {
-            // A5：安全期校验（读锁下查 strong_count + sealed_time）
+            // A5: safety-period check (strong_count + sealed_time under the read lock)
             let safe = {
                 let pool = self
                     .pool
@@ -1246,7 +1350,7 @@ impl VectorIndex {
                 reclaimed += 1;
                 tracing::info!(seg_id = sid, "reclaimed old segment file");
             }
-            // A5：删文件后从缓存移除映射（写锁）
+            // A5: after file deletion, remove the mapping from the cache (write lock)
             {
                 let mut pool = self
                     .pool
@@ -1349,7 +1453,7 @@ mod tests {
             assert_eq!(idx.len(), 10);
             idx.checkpoint().unwrap();
         }
-        // 重开：图应从 snapshot 重载
+        // Reopen: the graph should be reloaded from the snapshot
         let idx2 = make_index(&ns_dir, 8, MetricKind::L2);
         assert_eq!(idx2.len(), 10, "graph reloaded from snapshot");
         let q = vec![3.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
@@ -1357,18 +1461,22 @@ mod tests {
         assert_eq!(res[0].0, 3, "knn works after reload");
     }
 
-    // R1 回归：compact 期间 KNN 读不阻塞。旧实现 vec_slice 读路径需 pool.write，
-    // compact 持 pool.write 重排 → KNN 全量卡锁。现 vec_slice 取 &self（pool.read），
-    // compact 仅 step3 append 短暂持写锁，KNN 在扫描/图重建阶段并发服务。
-    // 真·并发：起线程跑 compact，主线程并行循环 KNN，加超时断言 —— 若 KNN 仍被写锁
-    // 阻塞，compact 耗时内 KNN 次数会远低于无竞争基线（这里用 2s 超时兜底防死锁卡测）。
+    // R1 regression: KNN reads are not blocked during compact. The old implementation needed
+    // pool.write on the vec_slice read path; compact held pool.write while reshuffling → KNN
+    // fully stuck on the lock. Now vec_slice takes &self (pool.read), and compact only holds
+    // the write lock briefly in step3 append; KNN is served concurrently during the
+    // scan/graph-rebuild phases.
+    // True concurrency: spawn a thread running compact while the main thread loops KNN in
+    // parallel, with a timeout assertion — if KNN were still blocked by the write lock, the
+    // KNN count within compact's duration would fall far below the uncontended baseline
+    // (a 2s timeout guards against a deadlock hanging the test).
     #[test]
     fn knn_runs_concurrently_with_compact() {
         use std::sync::Arc;
         use std::time::{Duration, Instant};
         let dir = tempdir().unwrap();
         let idx = Arc::new(make_index(dir.path(), 8, MetricKind::L2));
-        // 足量向量让 compact 有可观测耗时（非空操作）
+        // Enough vectors that compact has observable duration (not a no-op)
         for i in 0..2000u64 {
             let mut v = vec![0.0f32; 8];
             v[0] = i as f32;
@@ -1386,7 +1494,7 @@ mod tests {
             }
             count
         });
-        // 让 KNN 先跑起来，再触发 compact（确保两者重叠）
+        // Let KNN start running first, then trigger compact (ensuring the two overlap)
         std::thread::sleep(Duration::from_millis(20));
         let compact_start = Instant::now();
         let compact_res = idx.compact();
@@ -1394,9 +1502,11 @@ mod tests {
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         let knn_count = knn_handle.join().expect("knn thread panicked");
         compact_res.expect("compact ok");
-        // R1 核心断言：compact 期间 KNN 至少完成若干次（非零）。若读路径仍持写锁，
-        // compact 期间 KNN 一次都跑不动 → count 仅来自 compact 前后片段。
-        // 2000 向量 compact 在测试机 < 2s，KNN 循环应跑出数百次。
+        // R1 core assertion: KNN completes at least a few times during compact (nonzero). If
+        // the read path still held the write lock, KNN could not run at all during compact →
+        // count would come only from before/after fragments.
+        // A 2000-vector compact takes <2s on the test machine; the KNN loop should reach
+        // hundreds of iterations.
         assert!(
             knn_count > 5,
             "knn ran {} times during compact — R1 read-lock fix regressed (expected concurrent reads)",

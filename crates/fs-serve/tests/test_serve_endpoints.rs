@@ -1,13 +1,13 @@
-//! fs-serve 端点集成测试 —— 真实 HTTP bind + reqwest [v2 R3/A2/E5]
+//! fs-serve endpoint integration tests — real HTTP bind + reqwest [v2 R3/A2/E5]
 //!
-//! 验收对齐 PRD M4：
-//!   - /health 通（status ok / store_open / backpressure）
-//!   - /stats 通（KV used / vector_count / queue_depth）
-//!   - /metrics 通（Prometheus 文本格式，含 fusion_store_* 指标）
-//!   - /kv 写通（背压满返 503 A2）
-//!   - /knn 读通（插入向量后 KNN 召回）
-//!   - /admin/compact 通（COW 原子切换 A3）
-//!   - 背压：队列满 → 503 + /health 报 backpressure=true（degraded，供上游熔断 A2）
+//! Acceptance aligned with PRD M4:
+//!   - /health works (status ok / store_open / backpressure)
+//!   - /stats works (KV used / vector_count / queue_depth)
+//!   - /metrics works (Prometheus text format, incl. fusion_store_* metrics)
+//!   - /kv write works (backpressure full → 503, A2)
+//!   - /knn read works (KNN recall after inserting vectors)
+//!   - /admin/compact works (COW atomic swap, A3)
+//!   - backpressure: queue full → 503 + /health reports backpressure=true (degraded, for upstream circuit breaker A2)
 
 use std::sync::Arc;
 
@@ -20,9 +20,9 @@ use fs_serve::{
 use tempfile::tempdir;
 use tokio::sync::mpsc;
 
-/// 起一个绑定临时端口的 daemon，返回 base URL + AppState 句柄（测后清理）。
-/// auth: 空 AuthConfig=匿名放行；非空=按 RBAC 角色门禁（R10/F-SEC-2）。
-/// bind_is_loopback=true（测试默认绑环回）；/stats 守门测另设。
+/// Start a daemon bound to an ephemeral port, return base URL + AppState handle (cleaned up after the test).
+/// auth: empty AuthConfig = anonymous access; non-empty = RBAC role gating (R10/F-SEC-2).
+/// bind_is_loopback=true (tests default to loopback); the /stats gating test sets its own.
 async fn spawn_daemon(dim: usize, queue_cap: usize) -> (String, Arc<AppState>) {
     spawn_daemon_with_auth(dim, queue_cap, AuthConfig::empty(), true).await
 }
@@ -33,7 +33,7 @@ async fn spawn_daemon_with_auth(
     auth: AuthConfig,
     bind_is_loopback: bool,
 ) -> (String, Arc<AppState>) {
-    // leak tempdir 进 'static：DirHandle + 路径均不回收（测试进程退出即清理）
+    // leak the tempdir into 'static: neither DirHandle nor path is reclaimed (cleaned up when the test process exits)
     let dir = Box::leak(Box::new(tempdir().unwrap()));
     let ns_dir = dir.path();
     std::fs::create_dir_all(ns_dir).unwrap();
@@ -45,7 +45,7 @@ async fn spawn_daemon_with_auth(
     let compact_in_progress = Arc::new(std::sync::atomic::AtomicBool::new(false));
     metrics::init();
     fs_serve::refresh_seg_metrics(&engine);
-    // R3：写 worker 池
+    // R3: write worker pool
     let _workers = spawn_write_worker_pool(engine.clone(), queue_depth.clone(), rx, WRITE_WORKERS);
     let state = Arc::new(AppState {
         engine,
@@ -85,7 +85,7 @@ async fn health_returns_ok_when_idle() {
 #[tokio::test]
 async fn stats_reports_kv_and_vector_state() {
     let (url, state) = spawn_daemon(4, DEFAULT_QUEUE_CAP).await;
-    // 插一个向量（经 Engine 写 WAL + 落段，F2）
+    // Insert one vector (via Engine writing WAL + segments, F2)
     state
         .engine
         .insert_vector(1, &[1.0, 0.0, 0.0, 0.0], None)
@@ -98,11 +98,11 @@ async fn stats_reports_kv_and_vector_state() {
         .unwrap();
     assert_eq!(resp["vector_count"], 1);
     assert_eq!(resp["vector_dim"], 4);
-    // 图常驻 RAM 计量（§776 #9 评估基建）：单节点图，邻居数 ≤ M，占用 > 0
+    // Graph resident-RAM metering (§776 #9 eval infra): single-node graph, neighbors ≤ M, usage > 0
     let graph_mem = resp["graph_memory_bytes"].as_u64().unwrap();
     assert!(graph_mem > 0, "graph_memory_bytes > 0 for 1-node graph");
     assert_eq!(resp["queue_depth"], 0);
-    // P3：实际段文件磁盘占用 —— 插了 1 向量，vec 段预分配 128MB > 0
+    // P3: actual segment file disk usage — 1 vector inserted, vec segment preallocates 128MB > 0
     let vec_disk = resp["vec_disk_bytes"].as_u64().unwrap();
     assert!(vec_disk > 0, "vec_disk_bytes > 0 (segment preallocated)");
     assert!(
@@ -114,7 +114,7 @@ async fn stats_reports_kv_and_vector_state() {
 #[tokio::test]
 async fn metrics_endpoint_returns_prometheus_format() {
     let (url, _state) = spawn_daemon(4, DEFAULT_QUEUE_CAP).await;
-    // 触一次 health 让 ops_total 有计数
+    // Trigger one health request so ops_total has a count
     let _ = reqwest::get(format!("{}/health", url)).await.unwrap();
     let body = reqwest::get(format!("{}/metrics", url))
         .await
@@ -143,7 +143,7 @@ async fn kv_write_endpoint_roundtrips() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 204, "put_kv returns 204 No Content");
-    // /stats 应见 kv_used_bytes 增长
+    // /stats should show kv_used_bytes growth
     let stats: serde_json::Value = reqwest::get(format!("{}/stats", url))
         .await
         .unwrap()
@@ -157,7 +157,7 @@ async fn kv_write_endpoint_roundtrips() {
 #[tokio::test]
 async fn knn_endpoint_returns_hits() {
     let (url, state) = spawn_daemon(4, DEFAULT_QUEUE_CAP).await;
-    // 插入 5 向量（经 Engine）
+    // Insert 5 vectors (via Engine)
     for i in 0..5u64 {
         state
             .engine
@@ -176,7 +176,7 @@ async fn knn_endpoint_returns_hits() {
         .unwrap();
     let results = resp["results"].as_array().unwrap();
     assert_eq!(results.len(), 2);
-    // 最近应是 id=3
+    // Nearest should be id=3
     assert_eq!(results[0]["id"].as_u64().unwrap(), 3);
 }
 
@@ -199,9 +199,9 @@ async fn compact_endpoint_runs_cow() {
         .json()
         .await
         .unwrap();
-    // 软删 1 个，活 4
+    // 1 soft-deleted, 4 live
     assert_eq!(resp["live_vectors"].as_u64().unwrap(), 4);
-    // compact 期间 /health 报 degraded（compact_in_progress 短暂 true，此处已结束）
+    // During compact /health reports degraded (compact_in_progress briefly true; already finished here)
     let health: serde_json::Value = reqwest::get(format!("{}/health", url))
         .await
         .unwrap()
@@ -213,8 +213,8 @@ async fn compact_endpoint_runs_cow() {
 
 #[tokio::test]
 async fn backpressure_returns_503_when_queue_full() {
-    // 队列上限设极小（2），人为推高 queue_depth 到上限触发 503（A2 背压）
-    // 真实瞬时满由并发写竞争达成；此处确定性模拟队列满态：depth>=cap → 503
+    // Set the queue cap tiny (2), artificially push queue_depth to the cap to trigger 503 (A2 backpressure)
+    // Real transient fullness comes from concurrent write races; deterministically simulate a full queue here: depth>=cap → 503
     let (url, state) = spawn_daemon(4, 2).await;
     state
         .queue_depth
@@ -227,9 +227,9 @@ async fn backpressure_returns_503_when_queue_full() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 503, "queue full → 503 backpressure (A2)");
-    // /health 应报 backpressure=true（depth≥阈值 8K？此处 cap=2 阈值仍 8K——
-    // 验证 health 的 backpressure 用单独大 depth，见下测）
-    // 回退 depth 防污染后续
+    // /health should report backpressure=true (depth ≥ 8K threshold? here cap=2, threshold still 8K —
+    // verifying health's backpressure uses a separate large depth, see the test below)
+    // Reset depth to avoid polluting later assertions
     state
         .queue_depth
         .store(0, std::sync::atomic::Ordering::Relaxed);
@@ -237,7 +237,7 @@ async fn backpressure_returns_503_when_queue_full() {
 
 #[tokio::test]
 async fn health_reports_backpressure_when_depth_high() {
-    // /health 在 queue_depth ≥ BACKPRESSURE_THRESHOLD(8K) 时报 backpressure=true
+    // /health reports backpressure=true when queue_depth ≥ BACKPRESSURE_THRESHOLD(8K)
     let (url, state) = spawn_daemon(4, DEFAULT_QUEUE_CAP).await;
     state.queue_depth.store(
         fs_serve::BACKPRESSURE_THRESHOLD,
@@ -256,21 +256,21 @@ async fn health_reports_backpressure_when_depth_high() {
         .store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
-// R10/F-SEC-2：管理端点配 admin token 后，无 Bearer → 401，带正确 Bearer → 通过
+// R10/F-SEC-2: admin endpoint with an admin token configured — no Bearer → 401, correct Bearer → pass
 #[tokio::test]
 async fn admin_endpoint_requires_bearer_token() {
     let mut auth = AuthConfig::empty();
     auth.add("s3cret".into(), AuthRole::Admin);
     let (url, _state) = spawn_daemon_with_auth(4, DEFAULT_QUEUE_CAP, auth, true).await;
     let client = reqwest::Client::new();
-    // 无 token → 401
+    // no token → 401
     let resp = client
         .post(format!("{}/admin/compact", url))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 401, "compact without token → 401 (R10)");
-    // 错误 token → 401
+    // wrong token → 401
     let resp = client
         .post(format!("{}/admin/compact", url))
         .header("Authorization", "Bearer wrong")
@@ -278,7 +278,7 @@ async fn admin_endpoint_requires_bearer_token() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 401, "compact with wrong token → 401 (R10)");
-    // 正确 token → 非 401（空库 compact 可能 200/500，关键是不被 auth 拦）
+    // correct token → not 401 (compact on an empty store may be 200/500; the point is not being blocked by auth)
     let resp = client
         .post(format!("{}/admin/compact", url))
         .header("Authorization", "Bearer s3cret")
@@ -292,7 +292,7 @@ async fn admin_endpoint_requires_bearer_token() {
     );
 }
 
-// R10/F-SEC-2：写端点 /kv 配 admin token 后受 auth 保护（无 token → 401）
+// R10/F-SEC-2: write endpoint /kv is auth-protected once an admin token is configured (no token → 401)
 #[tokio::test]
 async fn kv_write_requires_bearer_when_auth_set() {
     let mut auth = AuthConfig::empty();
@@ -308,7 +308,7 @@ async fn kv_write_requires_bearer_when_auth_set() {
     assert_eq!(resp.status(), 401, "kv write without token → 401 (R10)");
 }
 
-// R10/F-SEC-2：只读端点 /health /stats 在环回绑定时不受 auth 限制（无 token 仍可读）
+// R10/F-SEC-2: read-only endpoints /health /stats are not auth-gated on loopback bind (readable without token)
 #[tokio::test]
 async fn read_endpoints_not_gated_by_auth() {
     let mut auth = AuthConfig::empty();
@@ -328,7 +328,7 @@ async fn read_endpoints_not_gated_by_auth() {
     );
 }
 
-// E10：向量写入端点 /vector 经写队列背压 + worker 池写 WAL + 连边
+// E10: vector write endpoint /vector goes through the write queue backpressure + worker pool writing WAL + links
 #[tokio::test]
 async fn vector_write_endpoint_roundtrips() {
     let (url, _state) = spawn_daemon(4, DEFAULT_QUEUE_CAP).await;
@@ -340,7 +340,7 @@ async fn vector_write_endpoint_roundtrips() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 204, "insert_vector returns 204 (E10)");
-    // KNN 应召回刚写的向量
+    // KNN should recall the just-written vector
     let resp: serde_json::Value = client
         .post(format!("{}/knn", url))
         .json(&serde_json::json!({"query": [1.0, 2.0, 3.0, 4.0], "top_k": 1}))
@@ -359,7 +359,7 @@ async fn vector_write_endpoint_roundtrips() {
     );
 }
 
-// F-SEC-2：RBAC 角色门禁 —— readonly token 写 /kv 拒 403，admin token 写通过
+// F-SEC-2: RBAC role gating — readonly token writing /kv → 403, admin token write passes
 #[tokio::test]
 async fn rbac_readonly_rejected_on_write() {
     let mut auth = AuthConfig::empty();
@@ -367,7 +367,7 @@ async fn rbac_readonly_rejected_on_write() {
     auth.add("adm-tok".into(), AuthRole::Admin);
     let (url, _state) = spawn_daemon_with_auth(4, DEFAULT_QUEUE_CAP, auth, true).await;
     let client = reqwest::Client::new();
-    // readonly 写 /kv → 403（角色不足）
+    // readonly writing /kv → 403 (insufficient role)
     let resp = client
         .post(format!("{}/kv", url))
         .header("Authorization", "Bearer ro-tok")
@@ -380,7 +380,7 @@ async fn rbac_readonly_rejected_on_write() {
         403,
         "readonly token write /kv → 403 (F-SEC-2 RBAC)"
     );
-    // admin 写 /kv → 204（admin ≥ readwrite）
+    // admin writing /kv → 204 (admin ≥ readwrite)
     let resp = client
         .post(format!("{}/kv", url))
         .header("Authorization", "Bearer adm-tok")
@@ -395,7 +395,7 @@ async fn rbac_readonly_rejected_on_write() {
     );
 }
 
-// F-SEC-2：readonly token 触发 compact → 403（compact 需 admin）
+// F-SEC-2: readonly token triggering compact → 403 (compact requires admin)
 #[tokio::test]
 async fn rbac_readonly_rejected_on_compact() {
     let mut auth = AuthConfig::empty();
@@ -415,14 +415,14 @@ async fn rbac_readonly_rejected_on_compact() {
     );
 }
 
-// F-OPS-8：非环回绑定时 /stats 需 ≥readonly 认证；无 token → 401，readonly token → 200
+// F-OPS-8: when not loopback-bound, /stats requires ≥readonly auth; no token → 401, readonly token → 200
 #[tokio::test]
 async fn stats_requires_auth_when_non_loopback() {
     let mut auth = AuthConfig::empty();
     auth.add("ro-tok".into(), AuthRole::Readonly);
     let (url, _state) = spawn_daemon_with_auth(4, DEFAULT_QUEUE_CAP, auth, false).await;
     let client = reqwest::Client::new();
-    // 无 token → 401
+    // no token → 401
     let resp = client.get(format!("{}/stats", url)).send().await.unwrap();
     assert_eq!(
         resp.status(),
@@ -443,38 +443,38 @@ async fn stats_requires_auth_when_non_loopback() {
     );
 }
 
-// F-SEC-1 / Rule 12 fail visibly：enforce_bind_auth_policy 启动门禁
-// 非环回 + 无 token → Err（拒启动）；环回 + 无 token / 任一 + 有 token → Ok
+// F-SEC-1 / Rule 12 fail visibly: enforce_bind_auth_policy startup gate
+// non-loopback + no token → Err (refuse to start); loopback + no token / either + token → Ok
 #[tokio::test]
 async fn bind_auth_policy_refuses_non_loopback_without_token() {
-    // 非环回 + 无 token → Err（hard fail，不裸奔）
+    // non-loopback + no token → Err (hard fail, never run unprotected)
     assert!(
         fs_serve::enforce_bind_auth_policy("0.0.0.0", false, false).is_err(),
         "non-loopback + no token → refuse start (F-SEC-1)"
     );
-    // 环回 + 无 token → Ok（匿名放行，本地调试）
+    // loopback + no token → Ok (anonymous access, local debugging)
     assert!(
         fs_serve::enforce_bind_auth_policy("127.0.0.1", true, false).is_ok(),
         "loopback + no token → allow (anonymous safe on loopback)"
     );
-    // 非环回 + 有 token → Ok（认证保护）
+    // non-loopback + token → Ok (auth protected)
     assert!(
         fs_serve::enforce_bind_auth_policy("0.0.0.0", false, true).is_ok(),
         "non-loopback + token → allow (auth protected)"
     );
-    // 环回 + 有 token → Ok
+    // loopback + token → Ok
     assert!(
         fs_serve::enforce_bind_auth_policy("127.0.0.1", true, true).is_ok(),
         "loopback + token → allow"
     );
 }
 
-// F-SEC-7：请求体超 16MB → 413 Payload Too Large（反序列化前拦截）
+// F-SEC-7: body over 16MB → 413 Payload Too Large (intercepted before deserialization)
 #[tokio::test]
 async fn body_limit_rejects_oversized_payload() {
     let (url, _state) = spawn_daemon(4, DEFAULT_QUEUE_CAP).await;
     let client = reqwest::Client::new();
-    // 构造超限 value（MAX_BODY_BYTES + 1，JSON 编码后更超，触发 DefaultBodyLimit）
+    // Build an oversized value (MAX_BODY_BYTES + 1, larger after JSON encoding, triggers DefaultBodyLimit)
     let oversized = "x".repeat(MAX_BODY_BYTES + 1);
     let resp = client
         .post(format!("{}/kv", url))

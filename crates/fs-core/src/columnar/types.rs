@@ -1,8 +1,8 @@
-//! 列式类型映射 —— 自维护轻量 dtype（不依赖 arrow serde feature）[v2 H3]
+//! Columnar type mapping — self-maintained lightweight dtype (no arrow serde feature) [v2 H3]
 
 use arrow::datatypes::DataType;
 
-/// M3 支持的定宽 primitive 列类型
+/// Fixed-width primitive column types supported in M3
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ColType {
     Int32,
@@ -13,7 +13,7 @@ pub enum ColType {
 }
 
 impl ColType {
-    /// 映射到 Arrow DataType
+    /// Map to the Arrow DataType
     pub fn to_arrow(&self) -> DataType {
         match self {
             ColType::Int32 => DataType::Int32,
@@ -24,17 +24,18 @@ impl ColType {
         }
     }
 
-    /// 单元素字节宽（L8：Boolean 位压缩，按位存储；append_aligned 用 1 = 无对齐填充）
+    /// Per-element byte width (L8: Boolean is bit-packed, stored per bit;
+    /// append_aligned uses 1 = no alignment padding)
     pub fn byte_width(&self) -> usize {
         match self {
             ColType::Int32 | ColType::Float32 => 4,
             ColType::Int64 | ColType::Float64 => 8,
-            // Boolean：位压缩（每 bit 1 值），字节缓冲对齐 1，无需 padding
+            // Boolean: bit-packed (1 value per bit), byte buffer alignment 1, no padding
             ColType::Boolean => 1,
         }
     }
 
-    /// 从 Arrow DataType 反推（仅 M3 支持范围）
+    /// Infer from an Arrow DataType (M3-supported range only)
     pub fn from_arrow(dt: &DataType) -> Option<Self> {
         match dt {
             DataType::Int32 => Some(ColType::Int32),
@@ -47,17 +48,17 @@ impl ColType {
     }
 }
 
-/// 单列持久化元信息（落 heed）
+/// Per-column persisted metadata (stored in heed)
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ColumnMeta {
     pub name: String,
     pub dtype: ColType,
     pub seg_id: u32,
     pub offset: u32,
-    pub len: u32, // 列 buffer 字节长度
+    pub len: u32, // column buffer length in bytes
 }
 
-/// 表持久化元信息（落 heed，key = table_id）
+/// Per-table persisted metadata (stored in heed, key = table_id)
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TableMeta {
     pub row_count: usize,

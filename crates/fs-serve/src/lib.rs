@@ -1,12 +1,12 @@
-//! fs-serve 库 —— HTTP daemon 逻辑（供 main + 集成测试共用）[v2 R3/A2/E5/R4/R10/E10/E11]
+//! fs-serve library — HTTP daemon logic (shared by main and integration tests) [v2 R3/A2/E5/R4/R10/E10/E11]
 //!
-//! A2 修复：所有入口持 Engine（聚合 KV+Vector+Columnar+WAL），不再裸持子模块。
-//! 写路径经 Engine → WAL（F2 崩溃安全），读路径经 Engine 委托子模块零拷贝。
-//! R3：多写 worker 池消费队列（非单线程串行）。
-//! R4：KNN 端点经 Semaphore 限并发 blocking 线程，防突发 OOM。
-//! R10：管理/写端点强制 Bearer Token 认证（FS_AUTH_TOKEN），无 token 拒 401。
-//! E10：HTTP API 完整化（put_kv + insert_vector + put_columnar + knn）。
-//! E11：compact 期间 /health 报 unavailable + HTTP 503，触发上游熔断切流。
+//! A2 fix: all entry points hold Engine (aggregating KV+Vector+Columnar+WAL) instead of holding submodules directly.
+//! Write path goes through Engine → WAL (F2 crash safety); read path goes through Engine delegating to submodules zero-copy.
+//! R3: a pool of write workers consumes the queue (not single-threaded serial).
+//! R4: KNN endpoint caps concurrent blocking threads via a Semaphore to prevent burst OOM.
+//! R10: admin/write endpoints enforce Bearer Token auth (FS_AUTH_TOKEN); missing token → 401.
+//! E10: HTTP API completed (put_kv + insert_vector + put_columnar + knn).
+//! E11: during compact, /health reports unavailable + HTTP 503, tripping upstream circuit breakers.
 
 pub mod metrics;
 
@@ -26,22 +26,22 @@ use tokio::sync::mpsc;
 use fs_core::compact::run_compact;
 use fs_core::{Engine, FusionStoreEngine};
 
-/// 写队列默认上限（10K 待写，PRD §3.3 A2）
+/// Default write queue cap (10K pending writes, PRD §3.3 A2)
 pub const DEFAULT_QUEUE_CAP: usize = 10_000;
-/// 背压告警阈值（队列 80% 满 → /health backpressure=true）
+/// Backpressure alert threshold (queue 80% full → /health backpressure=true)
 pub const BACKPRESSURE_THRESHOLD: usize = 8_000;
-/// 默认端口（11463，R3）
+/// Default port (11463, R3)
 pub const DEFAULT_PORT: u16 = 11463;
-/// R3：写 worker 池大小（并发消费写队列，破单线程串行瓶颈）
+/// R3: write worker pool size (concurrent queue consumers, removing the single-threaded serial bottleneck)
 pub const WRITE_WORKERS: usize = 4;
-/// R4：KNN 并发上限（blocking 线程数硬顶，防突发 1000 并发 OOM）
+/// R4: KNN concurrency cap (hard ceiling on blocking threads, prevents OOM from a burst of 1000 concurrent requests)
 pub const KNN_CONCURRENCY: usize = 64;
-/// F-SEC-7：HTTP 请求体上限（16MB，覆盖 Arrow IPC 批 + 向量批量写，拒超大 payload DoS）。
-/// 16MB 远超单批列式/向量写入常态；超限 axum 返 413 Payload Too Large，反序列化前拦截。
+/// F-SEC-7: HTTP request body limit (16MB, covers Arrow IPC batches + vector batch writes, rejects oversized payload DoS).
+/// 16MB is far above normal single-batch columnar/vector writes; over-limit requests get 413 Payload Too Large from axum, intercepted before deserialization.
 pub const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 
-/// 写请求（入队，后台 worker 池消费经 Engine 写 WAL + 落段）
-/// E10：枚举补全 InsertVector + PutColumnar，HTTP API 与底座对齐
+/// Write request (enqueued; the background worker pool consumes it and writes WAL + segments via Engine)
+/// E10: enum completed with InsertVector + PutColumnar, aligning the HTTP API with the core layer
 pub enum WriteReq {
     PutKv {
         key: Vec<u8>,
@@ -60,9 +60,9 @@ pub enum WriteReq {
     },
 }
 
-/// F-SEC-2：RBAC 角色 —— admin（全权，含 compact/管理）/ readwrite（KV+向量写，禁 compact）
-/// / readonly（仅读 KNN/stats）。FS_AUTH_TOKEN 默认映射 admin（向后兼容单 token 场景）。
-/// 角色经独立 env token 命名：FS_AUTH_TOKEN(admin) / FS_AUTH_TOKEN_RW / FS_AUTH_TOKEN_RO。
+/// F-SEC-2: RBAC roles — admin (full access, incl. compact/admin) / readwrite (KV+vector writes, no compact)
+/// / readonly (read-only KNN/stats). FS_AUTH_TOKEN maps to admin by default (back-compat for single-token setups).
+/// Roles are provisioned via separate env tokens: FS_AUTH_TOKEN(admin) / FS_AUTH_TOKEN_RW / FS_AUTH_TOKEN_RO.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum AuthRole {
     Readonly = 0,
@@ -80,11 +80,11 @@ impl AuthRole {
     }
 }
 
-/// F-SEC-2：认证配置 —— token→role 映射表。空表 = 匿名放行（仅环回部署安全）。
-/// 任一 token 命中即返其角色；不命中或未带 token 在「需认证端点」拒 401。
-/// F-SEC-3：token 来源经 main 从 env / FS_AUTH_TOKEN_FILE 载入，本结构不关心来源。
+/// F-SEC-2: auth config — token→role mapping. Empty table = anonymous access (safe for loopback-only deploys).
+/// Any token hit returns its role; a miss or missing token → 401 on auth-required endpoints.
+/// F-SEC-3: tokens are loaded by main from env / FS_AUTH_TOKEN_FILE; this struct is agnostic to the source.
 pub struct AuthConfig {
-    /// token 字符串 → 角色。常量时间比较见 token_match。
+    /// token string → role. See token_match for the constant-time comparison.
     tokens: HashMap<String, AuthRole>,
 }
 
@@ -95,7 +95,7 @@ impl AuthConfig {
         }
     }
 
-    /// 登记一个 token→role（main 启动时从 env 文件载入后调）
+    /// Register a token→role pair (called by main after loading from env/file at startup)
     pub fn add(&mut self, token: String, role: AuthRole) {
         self.tokens.insert(token, role);
     }
@@ -104,8 +104,9 @@ impl AuthConfig {
         self.tokens.is_empty()
     }
 
-    /// 校验 Bearer header → 命中返角色，未配置返 None（匿名放行），配置但未命中/不符返 None + 标记需拒。
-    /// 返 (matched_role, configured)：configured=false 表无 token 配置 → 匿名放行（admin 默认）。
+    /// Validate the Bearer header → returns the role on hit; None when unconfigured (anonymous access);
+    /// configured but no match/mismatch → None + flagged for rejection.
+    /// Returns (matched_role, configured): configured=false means no tokens are configured → anonymous access (admin default).
     fn check(&self, headers: &HeaderMap) -> (Option<AuthRole>, bool) {
         if self.tokens.is_empty() {
             return (None, false);
@@ -119,8 +120,8 @@ impl AuthConfig {
         let Some(tok) = raw.strip_prefix("Bearer ") else {
             return (None, true);
         };
-        // 常量时间比较：逐 token 比对（token 集合小，遍历开销可忽略）。
-        // 不用 HashMap::get（哈希短路泄露前缀），改为遍历 constant_eq。
+        // Constant-time comparison: check each token in turn (small token set, loop cost is negligible).
+        // Not HashMap::get (hash short-circuiting leaks prefixes); loop over constant_eq instead.
         for (stored, role) in &self.tokens {
             if constant_eq(tok.as_bytes(), stored.as_bytes()) {
                 return (Some(*role), true);
@@ -130,7 +131,7 @@ impl AuthConfig {
     }
 }
 
-/// 常量时间字节比较（防时序侧信道泄露 token 前缀）
+/// Constant-time byte comparison (prevents timing side-channel from leaking token prefixes)
 fn constant_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -142,19 +143,19 @@ fn constant_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// 共享状态 —— 持 Engine + 写队列深度 + compact 标志 + 写队列 sender + 队列上限
-/// + KNN 信号量（R4）+ auth（R10/F-SEC-2 RBAC）+ bind 是否环回（F-OPS-8 /stats 守门）
+/// Shared state — holds Engine + write queue depth + compact flag + write queue sender + queue cap
+/// + KNN semaphore (R4) + auth (R10/F-SEC-2 RBAC) + whether the bind is loopback (F-OPS-8 /stats gating)
 pub struct AppState {
     pub engine: Arc<Engine>,
     pub queue_depth: Arc<std::sync::atomic::AtomicUsize>,
     pub compact_in_progress: Arc<std::sync::atomic::AtomicBool>,
     pub write_tx: mpsc::Sender<WriteReq>,
     pub queue_cap: usize,
-    /// R4：KNN 并发限流信号量
+    /// R4: KNN concurrency-limiting semaphore
     pub knn_sem: Arc<tokio::sync::Semaphore>,
-    /// R10/F-SEC-2：token→role 认证配置（空 = 匿名放行，仅环回安全）
+    /// R10/F-SEC-2: token→role auth config (empty = anonymous access, loopback-only safe)
     pub auth: Arc<AuthConfig>,
-    /// F-OPS-8：bind 是否环回。true 时 /stats 匿名放行；false 时 /stats 需 ≥readonly 认证。
+    /// F-OPS-8: whether the bind is loopback. true → /stats allows anonymous; false → /stats requires ≥readonly auth.
     pub bind_is_loopback: bool,
 }
 
@@ -166,8 +167,8 @@ pub struct HealthResp {
     pub backpressure: bool,
 }
 
-// E11：status 三态字符串（ok/degraded/unavailable），HealthResp.status 用 &'static str
-// 经 const 匹配，避免 String 序列化开销。
+// E11: status is a three-state string (ok/degraded/unavailable); HealthResp.status uses &'static str
+// via const matching, avoiding String serialization overhead.
 
 #[derive(Serialize)]
 pub struct StatsResp {
@@ -188,14 +189,14 @@ pub struct PutKvReq {
     pub value: String,
 }
 
-// E10：向量写入请求
+// E10: vector write request
 #[derive(Deserialize)]
 pub struct InsertVectorReq {
     pub id: u64,
     pub vector: Vec<f32>,
 }
 
-// E10：列式写入请求 —— IPC 字节以 base64 文本承 JSON（HTTP 友好，客户端用 arrow IPC 编码后 b64）
+// E10: columnar write request — IPC bytes carried as base64 text in JSON (HTTP-friendly; clients encode arrow IPC then b64)
 #[derive(Deserialize)]
 pub struct PutColumnarReq {
     pub table_id: String,
@@ -225,10 +226,10 @@ pub struct CompactResp {
     pub reclaimable_segs: usize,
 }
 
-/// 构建 axum Router（main + 测试共用）
-/// R10：管理/写端点（compact/kv/vector/columnar）挂 auth；只读监控（health/metrics/knn）放行。
-/// F-OPS-8：/stats 仅非环回时挂 auth（stats_endpoint 内自判 bind_is_loopback）。
-/// F-SEC-7：全局 DefaultBodyLimit 16MB，拒超大 payload 在反序列化前 DoS。
+/// Build the axum Router (shared by main and tests)
+/// R10: admin/write endpoints (compact/kv/vector/columnar) mount auth; read-only monitoring (health/metrics/knn) stays open.
+/// F-OPS-8: /stats mounts auth only when not loopback-bound (stats_endpoint checks bind_is_loopback itself).
+/// F-SEC-7: global DefaultBodyLimit 16MB, rejecting oversized payload DoS before deserialization.
 pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health))
@@ -243,8 +244,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
-// R10/F-SEC-2：角色门禁校验。返授权角色（匿名放行时为 Admin，因仅环回无 token 场景安全）。
-// configured=true（配了 token）但未命中/角色不足 → 401/403。
+// R10/F-SEC-2: role gate check. Returns the authorized role (Admin when anonymous, safe since loopback-only no-token).
+// configured=true (tokens set) but no match/insufficient role → 401/403.
 fn require_role(
     state: &AppState,
     headers: &HeaderMap,
@@ -252,7 +253,7 @@ fn require_role(
 ) -> Result<AuthRole, AppError> {
     let (role, configured) = state.auth.check(headers);
     if !configured {
-        // 未配 token = 匿名放行（main 已对非环回+无 token 强警告）。匿名视作 Admin。
+        // No tokens configured = anonymous access (main already hard-warns on non-loopback + no token). Anonymous counts as Admin.
         return Ok(AuthRole::Admin);
     }
     match role {
@@ -272,8 +273,8 @@ fn require_role(
     }
 }
 
-/// F-SEC-2：compact 审计日志 —— 记谁（授权角色）触发了 compact + 起止 + 结果。
-/// token 本身不入日志（敏感），仅记角色 + 时间戳 + 段计数。
+/// F-SEC-2: compact audit log — records who (authorized role) triggered compact + timing + result.
+/// The token itself is never logged (sensitive); only role + timestamp + segment counts.
 fn audit_compact(role: AuthRole, live_vectors: usize, reclaimable: usize, elapsed_us: u64) {
     tracing::info!(
         actor_role = role.label(),
@@ -284,8 +285,8 @@ fn audit_compact(role: AuthRole, live_vectors: usize, reclaimable: usize, elapse
     );
 }
 
-/// F-SEC-2/F-SEC-3：从 env / 文件载入三角色 token 构 AuthConfig（main + fs-cli 共用）。
-/// env 取明文，file 取首行（去空白，避免 ps/proc 明文）。两源都缺的角色不登记。文件读失败 = Err。
+/// F-SEC-2/F-SEC-3: load three-role tokens from env / file into an AuthConfig (shared by main and fs-cli).
+/// env takes plaintext, file takes the first line (trimmed, avoiding ps/proc plaintext leak). Roles missing from both sources are not registered. File read failure = Err.
 pub fn build_auth_from_env() -> Result<AuthConfig, BuildAuthError> {
     let mut auth = AuthConfig::empty();
     load_role_token(
@@ -309,11 +310,11 @@ pub fn build_auth_from_env() -> Result<AuthConfig, BuildAuthError> {
     Ok(auth)
 }
 
-/// F-SEC-1 / Rule 12 fail visibly：绑定 + 认证策略校验（main + fs-cli serve 共用，可测）。
-/// 返 Ok(()) 表示通过；Err 表示拒绝启动。
-/// - 环回 + 无 token → Ok（匿名放行，本地调试安全）+ warn 由 caller 记
-/// - 非环回 + 无 token → Err（hard fail，admin/write 端点不裸奔）
-/// - 任一 + 有 token → Ok
+/// F-SEC-1 / Rule 12 fail visibly: bind + auth policy check (shared by main and fs-cli serve, testable).
+/// Ok(()) means pass; Err means refuse to start.
+/// - loopback + no token → Ok (anonymous access, safe for local debugging) + caller logs the warn
+/// - non-loopback + no token → Err (hard fail, admin/write endpoints never run unprotected)
+/// - either + token → Ok
 pub fn enforce_bind_auth_policy(
     bind: &str,
     bind_is_loopback: bool,
@@ -325,7 +326,7 @@ pub fn enforce_bind_auth_policy(
     Ok(())
 }
 
-/// enforce_bind_auth_policy 错误：非环回 + 无 token 拒启动
+/// enforce_bind_auth_policy error: non-loopback bind + no token refuses startup
 #[derive(Debug)]
 pub struct BindAuthPolicyError(pub String);
 
@@ -342,7 +343,7 @@ impl std::fmt::Display for BindAuthPolicyError {
 
 impl std::error::Error for BindAuthPolicyError {}
 
-/// build_auth_from_env 错误（文件读失败或空文件）
+/// build_auth_from_env error (file read failure or empty file)
 #[derive(Debug)]
 pub struct BuildAuthError(String);
 
@@ -391,8 +392,8 @@ async fn health(State(s): State<Arc<AppState>>) -> Response {
         .compact_in_progress
         .load(std::sync::atomic::Ordering::Relaxed);
     let backpressure = qd >= BACKPRESSURE_THRESHOLD;
-    // E11：compact 持写锁阻塞所有读 → unavailable + 503，上游熔断切流。
-    // 旧实现报 degraded 误导上游"慢但能用"，持续发读请求全卡锁。背压仍报 degraded（降级可用）。
+    // E11: compact holds the write lock blocking all reads → unavailable + 503, tripping upstream circuit breakers.
+    // The old impl reported degraded, misleading upstream into "slow but usable" while reads all stuck on the lock. Backpressure still reports degraded (reduced but usable).
     let (status, code) = if compact {
         ("unavailable", StatusCode::SERVICE_UNAVAILABLE)
     } else if backpressure {
@@ -417,8 +418,8 @@ async fn stats(
     State(s): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<StatsResp>, AppError> {
-    // F-OPS-8：非环回绑定时 /stats 暴露 namespace 规模（向量数/磁盘占用），需 ≥readonly 认证。
-    // 环回部署维持匿名放行（本地调试便利）。
+    // F-OPS-8: when not loopback-bound, /stats exposes namespace scale (vector count/disk usage), requires ≥readonly auth.
+    // Loopback deployments keep anonymous access (local debugging convenience).
     if !s.bind_is_loopback {
         require_role(&s, &headers, AuthRole::Readonly)?;
     }
@@ -464,9 +465,9 @@ async fn compact_endpoint(
     State(s): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<CompactResp>, AppError> {
-    // R10/F-SEC-2：管理端点强制 admin 角色（无 token 拒 401，防远程触发 compact DoS）
+    // R10/F-SEC-2: admin endpoint requires the admin role (no token → 401, prevents remote compact DoS)
     let role = require_role(&s, &headers, AuthRole::Admin)?;
-    // compact 期间标记 compact_in_progress 供 /health 报 unavailable（E11）
+    // During compact, set compact_in_progress so /health reports unavailable (E11)
     let was = s
         .compact_in_progress
         .swap(true, std::sync::atomic::Ordering::SeqCst);
@@ -491,7 +492,7 @@ async fn compact_endpoint(
     match res {
         Ok(r) => {
             metrics::observe("compact", "ok", us);
-            // F-SEC-2：审计日志（角色+结果+计数，不入 token 明文）
+            // F-SEC-2: audit log (role+result+counts, never the token plaintext)
             audit_compact(role, r.live_vectors, r.reclaimable_segs.len(), us);
             Ok(Json(CompactResp {
                 live_vectors: r.live_vectors,
@@ -511,7 +512,7 @@ async fn put_kv_endpoint(
     headers: HeaderMap,
     Json(req): Json<PutKvReq>,
 ) -> Result<StatusCode, AppError> {
-    // R10/F-SEC-2：写端点需 ≥readwrite 角色
+    // R10/F-SEC-2: write endpoints require ≥readwrite role
     require_role(&s, &headers, AuthRole::Readwrite)?;
     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
     let wreq = WriteReq::PutKv {
@@ -523,7 +524,7 @@ async fn put_kv_endpoint(
     await_write_done(done_rx, "put_kv").await
 }
 
-// E10：向量写入端点 —— 经写队列背压（同 KV），worker 池经 Engine.insert_vector 写 WAL+连边
+// E10: vector write endpoint — through the write queue backpressure (same as KV); the worker pool writes WAL+links via Engine.insert_vector
 async fn insert_vector_endpoint(
     State(s): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -540,7 +541,7 @@ async fn insert_vector_endpoint(
     await_write_done(done_rx, "insert_vector").await
 }
 
-// E10：列式写入端点 —— 客户端发 Arrow IPC(base64)，worker 解码后经 Engine.put_columnar 写
+// E10: columnar write endpoint — the client sends Arrow IPC (base64); the worker decodes and writes via Engine.put_columnar
 async fn put_columnar_endpoint(
     State(s): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -558,9 +559,9 @@ async fn put_columnar_endpoint(
     await_write_done(done_rx, "put_columnar").await
 }
 
-// 背压入队公共逻辑（put_kv/insert_vector/put_columnar 共用）：
-// 队列深度自检 + try_send 满即 503（A2，不无界堆积致上游 OOM）。
-// 调用方先建 oneshot (done_tx,done_rx)，done_tx 入 wreq，done_rx 自留 await。
+// Backpressure enqueue shared logic (used by put_kv/insert_vector/put_columnar):
+// self-checked queue depth + try_send; full → 503 (A2, no unbounded pile-up causing upstream OOM).
+// The caller creates the oneshot (done_tx,done_rx) first; done_tx goes into the wreq, done_rx is kept for awaiting.
 fn try_enqueue(s: &AppState, wreq: WriteReq, label: &str) -> Result<(), AppError> {
     let qd = s
         .queue_depth
@@ -608,8 +609,8 @@ async fn knn_endpoint(
     State(s): State<Arc<AppState>>,
     Json(req): Json<KnnReq>,
 ) -> Result<Json<KnnResp>, AppError> {
-    // R4：Semaphore 限并发 blocking 线程，防突发 1000 并发 OOM（每线程栈 2MB）。
-    // 拿不到许可立即 503 背压（不无限堆积 spawn_blocking）。
+    // R4: the Semaphore caps concurrent blocking threads, preventing OOM from a burst of 1000 concurrent requests (2MB stack each).
+    // If no permit is available, return 503 backpressure immediately (no unbounded spawn_blocking pile-up).
     let _permit = match s.knn_sem.clone().try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
@@ -641,7 +642,7 @@ async fn knn_endpoint(
     }))
 }
 
-/// axum 错误类型 —— 携 HTTP status + message
+/// axum error type — carries HTTP status + message
 pub struct AppError(pub StatusCode, pub String);
 
 impl IntoResponse for AppError {
@@ -656,7 +657,7 @@ impl From<fs_core::StoreError> for AppError {
     }
 }
 
-/// 刷新段使用率指标（KV used_bytes / quota_limit）
+/// Refresh segment usage metrics (KV used_bytes / quota_limit)
 pub fn refresh_seg_metrics(engine: &Engine) {
     let kv = engine.kv();
     if let Ok(used) = kv.used_bytes() {
@@ -664,12 +665,12 @@ pub fn refresh_seg_metrics(engine: &Engine) {
     }
 }
 
-/// 启动写 worker 池（R3：N 个并发消费，破单线程串行瓶颈；main + 测试共用）
+/// Start the write worker pool (R3: N concurrent consumers, removing the single-threaded serial bottleneck; shared by main and tests)
 ///
-/// 返回 join handle（代表 worker 池；任一 worker 退出不影响其余，handle 在所有 worker 结束时完成）。
-/// mpsc Receiver 单消费者，多 worker 需共享：用 Arc<Mutex<Receiver>> + try_recv + 1ms 退避。
-/// 取锁仅在取任务瞬间（μs），实际 Engine 写（mmap/heed，μs 级）并发执行，故锁竞争非瓶颈。
-/// E10：worker 按 WriteReq 类型分发 put_kv / insert_vector / put_columnar。
+/// Returns join handles (representing the worker pool; any worker exiting does not affect the rest, and the handles complete when all workers finish).
+/// mpsc Receiver is single-consumer; multiple workers share it via Arc<Mutex<Receiver>> + try_recv + 1ms backoff.
+/// The lock is held only while grabbing a task (μs); actual Engine writes (mmap/heed, μs-scale) run concurrently, so lock contention is not the bottleneck.
+/// E10: workers dispatch put_kv / insert_vector / put_columnar by WriteReq type.
 pub fn spawn_write_worker_pool(
     engine: Arc<Engine>,
     queue_depth: Arc<std::sync::atomic::AtomicUsize>,
@@ -687,9 +688,9 @@ pub fn spawn_write_worker_pool(
                 let mut guard = match rx.lock() {
                     Ok(g) => g,
                     Err(e) => {
-                        // F-ERR-1：毒锁恢复 —— worker 持锁时 panic 致 Mutex 中毒。
-                        // into_inner 取出底层 Receiver 强制续命（避免写队列全停），但状态可能不一致，
-                        // 显式告警 + 计 metric 供运维感知线程 panic 事件。
+                        // F-ERR-1: poisoned lock recovery — a worker panicking while holding the lock poisons the Mutex.
+                        // into_inner pulls out the underlying Receiver to keep it alive (avoiding a full write-queue stall), but state may be inconsistent,
+                        // so warn explicitly + count a metric so ops can see the thread panic event.
                         tracing::error!(
                             wid,
                             "write worker rx lock poisoned — recovered via into_inner (a worker panicked)"
@@ -714,7 +715,7 @@ pub fn spawn_write_worker_pool(
     handles
 }
 
-/// 处理单个写请求（worker 池共用）—— 按 WriteReq 类型分发，经 Engine 写 WAL + 落段（F2 崩溃安全）
+/// Handle a single write request (shared by the worker pool) — dispatch by WriteReq type, write WAL + segments via Engine (F2 crash safety)
 fn handle_write_req(
     engine: &Engine,
     queue_depth: &std::sync::atomic::AtomicUsize,
@@ -738,7 +739,7 @@ fn handle_write_req(
             done,
         } => {
             let start = std::time::Instant::now();
-            // E10：解码 IPC → RecordBatch → put_columnar
+            // E10: decode IPC → RecordBatch → put_columnar
             let res = (|| -> fs_core::Result<()> {
                 let batch = fs_core::engine_impl::decode_ipc(&ipc)?;
                 engine.put_columnar(&table_id, &batch, None)
@@ -747,7 +748,7 @@ fn handle_write_req(
         }
     };
     let us = start.elapsed().as_micros() as u64;
-    // 队列深度回退（任务已出队执行）
+    // Queue depth decrement (task dequeued and executing)
     let qd = queue_depth.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     metrics::set_queue_depth(qd.saturating_sub(1));
     match res {
@@ -766,7 +767,7 @@ fn handle_write_req(
     }
 }
 
-/// base64 解码（E10 /columnar 端点用）
+/// base64 decode (used by the E10 /columnar endpoint)
 fn base64_decode(s: &str) -> Result<Vec<u8>, AppError> {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD

@@ -1,4 +1,4 @@
-//! 错误类型 —— thiserror，失败可见不兜底
+//! Error types — thiserror, fail visibly with no silent fallbacks
 
 use thiserror::Error;
 
@@ -39,23 +39,26 @@ pub enum StoreError {
     #[error("corrupt: {0}")]
     Corrupt(String),
 
-    // E8：heed/LMDB map_size 写满（MapFull）。caller 据此决定扩 map_size 或告警，
-    // 非 panic。当前 map_size=2GB（KV locator 12B/项 ≈ 1.8 亿 key），企业级容量预警。
+    // E8: heed/LMDB map_size full (MapFull). Caller decides whether to grow map_size
+    // or raise an alert — not a panic. Current map_size=2GB (KV locator 12B/entry,
+    // roughly 180M keys), sized for enterprise capacity headroom.
     #[error("heed map full: metadata exceeded map_size ({current} bytes, limit {limit})")]
     MapFull { current: u64, limit: u64 },
 
     #[error("operation timed out")]
     Timeout,
 
-    // F3：payload/offset 超 u32::MAX 拒绝，免静默截断损坏
+    // F3: reject payload/offset above u32::MAX to avoid silent truncation corruption
     #[error("value too large: {0} bytes exceeds u32 max")]
     ValueTooLarge(usize),
 
-    // L5：锁中毒（写侧持锁 panic）显式报错，不 unwrap panic 扩散
+    // L5: lock poisoning (writer panicked while holding the lock) reported explicitly
+    // instead of spreading via unwrap panic
     #[error("lock poisoned: writer panicked while holding lock")]
     LockPoisoned,
 
-    // F-TEST-2：空 key / 超 LMDB MDB_MAXKEYSIZE key 显式拒，免晦涩 BadValSize（Rule 12 fail visibly）
+    // F-TEST-2: reject empty keys and keys above LMDB MDB_MAXKEYSIZE explicitly
+    // instead of the cryptic BadValSize (Rule 12: fail visibly)
     #[error("invalid key: {0}")]
     InvalidKey(&'static str),
 

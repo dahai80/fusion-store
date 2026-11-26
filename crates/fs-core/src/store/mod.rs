@@ -1,8 +1,9 @@
-//! L-STORE 持久化层 —— heed KV + 段池 + namespace 配额 [v2 E1/E6]
+//! L-STORE persistence layer — heed KV + segment pool + namespace quota [v2 E1/E6]
 //!
-//! KV value 一律落 mmap payload 段（零拷贝读指针落 mmap 区域，对齐 §1.4 断言）。
-//! heed 只存 (key -> ValueLocator) + namespace 配额计数。
-//! 多进程单写：flock 快速失败（R1）。
+//! KV values always land in mmap payload segments (zero-copy read pointers point into
+//! the mmap region, matching the §1.4 assertion). heed stores only (key -> ValueLocator)
+//! plus namespace quota counters.
+//! Multi-process single writer: flock fails fast (R1).
 
 pub mod kv;
 

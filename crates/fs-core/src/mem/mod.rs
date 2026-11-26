@@ -1,6 +1,7 @@
-//! L-MEM 零拷贝 mmap 内存管理层
+//! L-MEM zero-copy mmap memory management layer
 //!
-//! 段 append-only 不可变 (H2/H4)：写满封存只读，永不改大小，根治 SIGBUS/并发撕裂。
+//! Segments are append-only and immutable (H2/H4): sealed full segments become read-only
+//! and never resize, eliminating SIGBUS and concurrent tearing at the root.
 
 pub mod mmap;
 pub mod recover;

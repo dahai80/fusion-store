@@ -1,11 +1,14 @@
-//! 列式存储 —— col mmap 段 + heed 表/列元信息 + 零拷贝读 [v2 H3/E3]
+//! Columnar storage — col mmap segments + heed table/column metadata + zero-copy reads [v2 H3/E3]
 //!
-//! put_columnar：逐列 Buffer 写 col 段（append-only）+ TableMeta 落 heed（key=table_id）。
-//! get_columnar_zero_copy：读 TableMeta → 映射封存 col 段 → Buffer::from_custom_allocation
-//!   （owner=Arc<MmapHandle> impl Allocation，引用计数保活 mmap）→ 重构 PrimitiveArray
-//!   → RecordBatch → ZeroCopyArrowBatch（持 Arc<MmapHandle> 保活，段不可变保指针有效）。
+//! put_columnar: per-column Buffers written into col segments (append-only) + TableMeta
+//! into heed (key=table_id).
+//! get_columnar_zero_copy: read TableMeta → map the sealed col segment →
+//!   Buffer::from_custom_allocation (owner=Arc<MmapHandle> implementing Allocation, refcount
+//!   keeps the mmap alive) → rebuild PrimitiveArray → RecordBatch → ZeroCopyArrowBatch
+//!   (holds Arc<MmapHandle> for keepalive; immutable segments keep pointers valid).
 //!
-//! 复用 mem::segment::SegmentPool（col 段同 append-only 不可变语义，H4）。
+//! Reuses mem::segment::SegmentPool (col segments share the append-only immutable
+//! semantics, H4).
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -26,16 +29,17 @@ use crate::mem::mmap::MmapHandle;
 use crate::mem::segment::SegmentPool;
 use crate::StoreError;
 
-/// 表元信息 heed 库名
+/// heed db name for table metadata
 const COL_TABLE_DB: &str = "col_tables";
-/// 列式配额计数 DB（A3：与 KV 对称，key=固定 "used" -> u64 字节）
+/// Columnar quota counter DB (A3: symmetric with KV, key = fixed "used" -> u64 bytes)
 const COL_QUOTA_DB: &str = "col_quota";
 const COL_QUOTA_KEY: &[u8] = b"used";
-/// F-CODE-2：列式 heed env map_size 上限（meta：table_meta + quota）。
-/// table_meta 随表数+列数增长，2GB 留充足余量（E8）；写满抛 MapFull（非 panic）。
+/// F-CODE-2: columnar heed env map_size cap (meta: table_meta + quota).
+/// table_meta grows with table+column count; 2GB leaves ample headroom (E8). Full map
+/// surfaces MapFull (not a panic).
 const COL_META_MAP_SIZE: usize = 2 * 1024 * 1024 * 1024;
 
-/// 列式存储 —— 单 namespace
+/// Columnar storage — single namespace
 pub struct ColumnarStore {
     env: Env,
     table_db: Database<Bytes, Bytes>,
@@ -45,24 +49,25 @@ pub struct ColumnarStore {
     quota_limit: u64,
 }
 
-// —— 零拷贝 Buffer owner：Arc<MmapHandle> 持有 mmap，Arc 归零时释放映射 ——
-// arrow Buffer::from_custom_allocation 需 Arc<dyn Allocation>。
-// Allocation trait 有 blanket impl（T: RefUnwindSafe+Send+Sync），MmapHandle 已满足，
-// 故 MmapAllocation 自动满足 Allocation，无需手写 impl。
+// —— Zero-copy Buffer owner: Arc<MmapHandle> owns the mmap; the mapping is released when
+// the Arc reaches zero ——
+// arrow Buffer::from_custom_allocation requires Arc<dyn Allocation>.
+// The Allocation trait has a blanket impl (T: RefUnwindSafe+Send+Sync); MmapHandle already
+// satisfies it, so MmapAllocation automatically implements Allocation — no manual impl needed.
 struct MmapAllocation {
     #[allow(dead_code)]
     handle: Arc<MmapHandle>,
 }
 
 impl ColumnarStore {
-    /// 打开/创建列式 store。data_dir = ns_dir/col_data，meta_dir = ns_dir/meta
-    /// quota_limit=0 表示不限（A3：与 KV 配额对称）
+    /// Open/create the columnar store. data_dir = ns_dir/col_data, meta_dir = ns_dir/meta
+    /// quota_limit=0 means unlimited (A3: symmetric with the KV quota)
     pub fn open(namespace_dir: &Path, seg_size: u64, quota_limit: u64) -> Result<Self> {
         let data_dir = namespace_dir.join("col_data");
         let meta_dir = namespace_dir.join("meta");
         std::fs::create_dir_all(&meta_dir)?;
         std::fs::create_dir_all(&data_dir)?;
-        // L4：flock 多进程写互斥（与 KvStore 一致，try_lock 快速失败）
+        // L4: flock multi-process write exclusion (same as KvStore; try_lock fails fast)
         let lock_path = namespace_dir.join("col.lock");
         let lock_file = std::fs::OpenOptions::new()
             .read(true)
@@ -72,10 +77,10 @@ impl ColumnarStore {
             .open(&lock_path)?;
         let env = unsafe {
             EnvOpenOptions::new()
-                // F-CODE-2：map_size 提至 2GB，免 table_meta 膨胀触 MapFull panic
+                // F-CODE-2: map_size raised to 2GB so table_meta growth never hits MapFull panic
                 .map_size(COL_META_MAP_SIZE)
                 .max_dbs(crate::HEED_MAX_DBS)
-                // NO_SYNC：WAL 唯一 crash-safe 同步点（H5）， heed 仅存元数据
+                // NO_SYNC: the WAL is the sole crash-safe sync point (H5); heed stores metadata only
                 .flags(heed::EnvFlags::NO_SYNC)
                 .open(&meta_dir)?
         };
@@ -97,7 +102,8 @@ impl ColumnarStore {
         })
     }
 
-    /// 拿写锁（E9：阻塞 flock，非轮询）。None=内核阻塞 lock_exclusive；Some(d)=限时 5ms 短睡逼近。
+    /// Acquire the write lock (E9: blocking flock, not polling). None = kernel-blocking
+    /// lock_exclusive; Some(d) = time-bounded 5ms short-sleep retry loop.
     fn acquire_write_lock(&self, timeout: Option<Duration>) -> Result<()> {
         match timeout {
             None => self
@@ -120,14 +126,14 @@ impl ColumnarStore {
         }
     }
 
-    /// 写列式表：逐列 buffer 落段 + TableMeta 落 heed
+    /// Write a columnar table: per-column buffers into segments + TableMeta into heed
     pub fn put_columnar(
         &self,
         table_id: &str,
         batch: &RecordBatch,
         timeout: Option<std::time::Duration>,
     ) -> Result<()> {
-        // L4：flock 多进程写互斥
+        // L4: flock multi-process write exclusion
         self.acquire_write_lock(timeout)?;
         let res = self.put_columnar_inner(table_id, batch);
         let _ = self.lock_file.unlock();
@@ -137,7 +143,8 @@ impl ColumnarStore {
     fn put_columnar_inner(&self, table_id: &str, batch: &RecordBatch) -> Result<()> {
         let row_count = batch.num_rows();
         let mut wtxn = self.env.write_txn()?;
-        // A3：配额校验（与 KV 对称）。先读旧表元信息（覆盖时减旧字节）。
+        // A3: quota check (symmetric with KV). Read the old table metadata first
+        // (subtract old bytes on overwrite).
         let old_bytes: u64 = match self.table_db.get(&wtxn, table_id.as_bytes())? {
             Some(prev) => {
                 let prev_meta: TableMeta = serde_json::from_slice(prev)?;
@@ -146,7 +153,8 @@ impl ColumnarStore {
             None => 0,
         };
         let used = read_col_quota_txn(&self.quota_db, &wtxn)?;
-        // L3：全程持 pool 锁，记录首列落段前的 active 游标，commit 失败回滚免段内泄漏。
+        // L3: pool lock held throughout; record the active cursor before the first column
+        // lands so a failed commit rolls back and never leaks bytes inside the segment.
         let mut pool = self.pool.lock().map_err(|_| StoreError::LockPoisoned)?;
         let rollback_seg = pool.active_seg_id();
         let rollback_off = pool.active_cursor() as u32;
@@ -191,10 +199,12 @@ impl ColumnarStore {
             Ok(())
         })();
         if let Err(e) = append_result {
-            // L3：中途 append 失败，回退到首列前游标，免半写表段内泄漏
+            // L3: mid-way append failure rewinds to the pre-first-column cursor so a
+            // half-written table never leaks bytes inside the segment
             tracing::warn!(table_id, err = ?e, "put_columnar append failed, rewinding");
             if let Err(re) = pool.rewind_active_to(rollback_seg, rollback_off) {
-                // F-ERR-2：rewind 本身失败段内留垃圾，但不掩盖原始 append 错；显式告警供运维介入
+                // F-ERR-2: a failed rewind leaves garbage in the segment, but never masks
+                // the original append error; alert loudly for operator intervention
                 tracing::error!(
                     table_id,
                     seg = rollback_seg,
@@ -205,7 +215,7 @@ impl ColumnarStore {
             }
             return Err(e);
         }
-        // A3：配额净增校验（覆盖语义下减旧表字节）
+        // A3: net quota growth check (old table bytes subtracted under overwrite semantics)
         let net = appended_bytes.saturating_sub(old_bytes);
         let new_used = used.checked_add(net).ok_or(StoreError::QuotaExceeded)?;
         if self.quota_limit > 0 && new_used > self.quota_limit {
@@ -236,7 +246,7 @@ impl ColumnarStore {
         self.table_db
             .put(&mut wtxn, table_id.as_bytes(), &meta_bytes)?;
         write_col_quota_txn(&self.quota_db, &mut wtxn, new_used)?;
-        // L3：commit 失败也回滚段字节
+        // L3: a failed commit also rolls back segment bytes
         if let Err(e) = wtxn.commit() {
             tracing::warn!(table_id, err = ?e, "put_columnar commit failed, rewinding");
             if let Err(re) = pool.rewind_active_to(rollback_seg, rollback_off) {
@@ -259,9 +269,10 @@ impl ColumnarStore {
         Ok(())
     }
 
-    /// 零拷贝读列式表：映射封存段 → Buffer::from_custom_allocation → 重构 RecordBatch
+    /// Zero-copy read of a columnar table: map sealed segment → Buffer::from_custom_allocation → rebuild RecordBatch
     ///
-    /// columns 参数筛选列（None/空 = 全列）。返回 ZeroCopyArrowBatch 持 Arc<MmapHandle>。
+    /// The columns parameter filters columns (None/empty = all columns). Returns a
+    /// ZeroCopyArrowBatch holding Arc<MmapHandle>.
     pub fn get_columnar_zero_copy(
         &self,
         table_id: &str,
@@ -277,11 +288,12 @@ impl ColumnarStore {
 
         let mut fields: Vec<arrow::datatypes::Field> = Vec::with_capacity(meta.columns.len());
         let mut arrays: Vec<ArrayRef> = Vec::with_capacity(meta.columns.len());
-        // 保活所有列涉及的 mmap handle（任一即可保活整段；收集首个供 ZeroCopyArrowBatch）
+        // Keep alive the mmap handles involved in all columns (any one keeps the whole
+        // segment alive; collect the first for ZeroCopyArrowBatch)
         let mut keepalive: Option<Arc<MmapHandle>> = None;
 
         for cmeta in &meta.columns {
-            // 列筛选
+            // Column filter
             if !columns.is_empty() && !columns.iter().any(|c| *c == cmeta.name) {
                 continue;
             }
@@ -307,7 +319,7 @@ impl ColumnarStore {
             arrays.push(arr);
         }
         let Some(keepalive) = keepalive else {
-            // 列筛选命中空集
+            // Column filter matched an empty set
             return Ok(None);
         };
         let schema = Arc::new(arrow::datatypes::Schema::new(fields));
@@ -322,7 +334,7 @@ impl ColumnarStore {
         )))
     }
 
-    /// 有序落盘：flush active 段 + heed force_sync（A6 close 用）
+    /// Orderly flush: flush the active segment + heed force_sync (used by A6 close)
     pub fn flush(&self) -> Result<()> {
         let mut pool = self.pool.lock().map_err(|_| StoreError::LockPoisoned)?;
         pool.flush()?;
@@ -331,25 +343,25 @@ impl ColumnarStore {
         Ok(())
     }
 
-    /// 当前列式 namespace 已用字节（A3）
+    /// Current columnar namespace used bytes (A3)
     pub fn used_bytes(&self) -> Result<u64> {
         let rtxn = self.env.read_txn()?;
         read_col_quota_txn(&self.quota_db, &rtxn)
     }
 
-    /// 列式配额上限（A3）
+    /// Columnar quota limit (A3)
     pub fn quota_limit(&self) -> u64 {
         self.quota_limit
     }
 
-    /// 实际段文件磁盘占用（P3：与 KV disk_bytes 对称）
+    /// Actual segment-file disk usage (P3: symmetric with KV disk_bytes)
     pub fn disk_bytes(&self) -> Result<u64> {
         let pool = self.pool.lock().map_err(|_| StoreError::LockPoisoned)?;
         pool.disk_bytes()
     }
 }
 
-// —— A3：列式配额读写，txn 参数化（与 KV 对称）——
+// —— A3: columnar quota read/write, txn-parameterized (symmetric with KV) ——
 fn read_col_quota_txn(db: &Database<Bytes, Bytes>, txn: &RoTxn) -> Result<u64> {
     if let Some(bytes) = db.get(txn, COL_QUOTA_KEY)? {
         if bytes.len() == 8 {
@@ -369,9 +381,11 @@ fn write_col_quota_txn(db: &Database<Bytes, Bytes>, wtxn: &mut RwTxn, val: u64) 
     Ok(())
 }
 
-/// 取 primitive 列的 raw data buffer 字节（落段前）。
-/// F-COL-2：downcast 失败回 StoreError::Corrupt（非 panic）——dtype 由 ColType::from_arrow
-/// 上游校验，理论不失败；但 arrow 动态类型不保证，downcast 错配以显式错误暴露，不吞没。
+/// Extract the raw data buffer bytes of a primitive column (before landing in a segment).
+/// F-COL-2: downcast failure returns StoreError::Corrupt (not a panic) — dtype is validated
+/// upstream by ColType::from_arrow so this theoretically never fails; but arrow dynamic
+/// typing gives no guarantee, so a downcast mismatch surfaces as an explicit error,
+/// never swallowed.
 fn primitive_buffer_bytes(dt: &DataType, arr: &dyn arrow::array::Array) -> Result<Vec<u8>> {
     match dt {
         DataType::Int32 => {
@@ -403,8 +417,9 @@ fn primitive_buffer_bytes(dt: &DataType, arr: &dyn arrow::array::Array) -> Resul
             Ok(bytemuck_cast(a.values().as_ref()))
         }
         DataType::Boolean => {
-            // L8：Boolean 位压缩存储（Arrow 原生布局，每 bit 1 值），
-            // 读端 new_from_packed 零拷贝重构。位压缩由 BooleanBuilder 完成。
+            // L8: Boolean is bit-packed (Arrow native layout, 1 value per bit);
+            // the reader rebuilds zero-copy via new_from_packed. Bit-packing is done
+            // by BooleanBuilder.
             use arrow::array::BooleanBuilder;
             let a = arr
                 .as_any()
@@ -419,7 +434,7 @@ fn primitive_buffer_bytes(dt: &DataType, arr: &dyn arrow::array::Array) -> Resul
     }
 }
 
-/// 从 mmap 段 + 列元信息重构 primitive Array（零拷贝）
+/// Rebuild a primitive Array from an mmap segment + column metadata (zero-copy)
 fn build_primitive_array(
     dtype: &ColType,
     handle: &Arc<MmapHandle>,
@@ -427,9 +442,9 @@ fn build_primitive_array(
     len: usize,
     row_count: usize,
 ) -> Result<ArrayRef> {
-    // 零拷贝 Buffer：owner = MmapAllocation{handle}，Arc<dyn Allocation>
+    // Zero-copy Buffer: owner = MmapAllocation{handle}, Arc<dyn Allocation>
     let region = handle.as_bytes();
-    let _ = region; // 借用保指针在段内（构造时校验偏移）
+    let _ = region; // borrow keeps the pointer inside the segment (offset validated at construction)
     let base = handle.as_bytes().as_ptr() as *mut u8;
     let ptr = unsafe { std::ptr::NonNull::new_unchecked(base.add(offset)) };
     let owner: Arc<dyn arrow::alloc::Allocation> = Arc::new(MmapAllocation {
@@ -454,8 +469,8 @@ fn build_primitive_array(
             Ok(Arc::new(Float64Array::new(sb, None)))
         }
         ColType::Boolean => {
-            // L8：Boolean 位压缩零拷贝读。buffer = 位压缩 mmap 字节，
-            // new_from_packed(buf, offset=0 bit, len=row_count bits) 零拷贝重构。
+            // L8: Boolean bit-packed zero-copy read. buffer = bit-packed mmap bytes;
+            // new_from_packed(buf, offset=0 bit, len=row_count bits) rebuilds zero-copy.
             Ok(Arc::new(BooleanArray::new_from_packed(
                 buffer, 0, row_count,
             )))
@@ -463,7 +478,7 @@ fn build_primitive_array(
     }
 }
 
-/// bytemuck cast slice 到 u8 字节
+/// bytemuck cast a slice to u8 bytes
 fn bytemuck_cast<T: bytemuck::Pod>(slice: &[T]) -> Vec<u8> {
     bytemuck::cast_slice::<T, u8>(slice).to_vec()
 }
@@ -491,14 +506,15 @@ mod tests {
         let store = ColumnarStore::open(dir.path(), 0, 0).unwrap();
         let batch = make_batch();
         store.put_columnar("t1", &batch, None).unwrap();
-        // 触发封存使 payload 进封存段（段默认 64MB，小数据不封存——直接 active 段也零拷贝可读）
+        // Force sealing so the payload lands in a sealed segment (default segment is 64MB;
+        // small data stays unsealed — the active segment is also readable zero-copy)
         let out = store
             .get_columnar_zero_copy("t1", &[], None)
             .unwrap()
             .unwrap();
         assert_eq!(out.batch.num_rows(), 4);
         assert_eq!(out.batch.num_columns(), 2);
-        // 校验数据正确
+        // Verify data correctness
         let id = out
             .batch
             .column(0)
@@ -520,7 +536,7 @@ mod tests {
 
     #[test]
     fn all_types_roundtrip() {
-        // E4：真实 Arrow buffer 往返，覆盖全部 M3 定宽类型
+        // E4: real Arrow buffer round-trip covering all M3 fixed-width types
         let dir = tempdir().unwrap();
         let store = ColumnarStore::open(dir.path(), 0, 0).unwrap();
         let schema = Arc::new(Schema::new(vec![
@@ -567,9 +583,10 @@ mod tests {
 
     #[test]
     fn zero_copy_pointer_in_mmap_region() {
-        // 零拷贝断言：读出的列 buffer 指针落在 mmap 段区域内
+        // Zero-copy assertion: the read column buffer pointer lands inside the mmap segment region
         let dir = tempdir().unwrap();
-        // 极小段强制封存，使 payload 进封存段（sealed_handle 返回的 Arc<MmapHandle>）
+        // Tiny segment forces sealing so the payload lands in a sealed segment
+        // (sealed_handle returns the Arc<MmapHandle>)
         let store = ColumnarStore::open(dir.path(), 64, 0).unwrap();
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
         let batch =
@@ -580,7 +597,8 @@ mod tests {
             .get_columnar_zero_copy("z", &[], None)
             .unwrap()
             .unwrap();
-        // batch 持 keepalive，buffer 指针应源自 mmap 段；校验数据正确即证零拷贝路径
+        // The batch holds the keepalive; the buffer pointer should originate from the mmap
+        // segment — verifying data correctness proves the zero-copy path
         let x = out
             .batch
             .column(0)
@@ -626,7 +644,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = ColumnarStore::open(dir.path(), 0, 0).unwrap();
         let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int32, true)]));
-        // 含 null 的数组
+        // Array containing nulls
         let arr = Int32Array::from(vec![Some(1), None, Some(3)]);
         let batch = RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap();
         let err = store.put_columnar("nulls", &batch, None).unwrap_err();
@@ -646,21 +664,21 @@ mod tests {
 
     #[test]
     fn quota_exceeded_rejects_put_columnar() {
-        // A3：列式配额与 KV 对称，超限拒绝写
+        // A3: columnar quota symmetric with KV; writes above the limit are rejected
         let dir = tempdir().unwrap();
-        // 配额 16 字节（单 i32 列 4 行 = 16 字节）
+        // Quota of 16 bytes (single i32 column, 4 rows = 16 bytes)
         let store = ColumnarStore::open(dir.path(), 0, 16).unwrap();
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4]))])
                 .unwrap();
-        // 首次写 16 字节，刚好达限
+        // First write of 16 bytes hits the limit exactly
         store.put_columnar("t", &batch, None).unwrap();
         assert_eq!(store.used_bytes().unwrap(), 16);
-        // 覆盖写同表 16 字节，net=0，应通过
+        // Overwrite the same table with 16 bytes, net=0, should pass
         store.put_columnar("t", &batch, None).unwrap();
         assert_eq!(store.used_bytes().unwrap(), 16);
-        // 新表再加 16 字节，超限拒绝
+        // A new table adding 16 more bytes exceeds the limit and is rejected
         let err = store.put_columnar("t2", &batch, None).unwrap_err();
         assert!(matches!(err, StoreError::QuotaExceeded));
     }

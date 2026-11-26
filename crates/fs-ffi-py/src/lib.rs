@@ -1,20 +1,22 @@
-//! fs-ffi-py —— fusion-store Python 绑定（PyO3）[v2 §3.4/E3]
+//! fs-ffi-py — fusion-store Python bindings (PyO3) [v2 §3.4/E3]
 //!
-//! 薄封装 fs-core，不含业务逻辑。
-//! 入参向量 numpy.ndarray f32 连续零拷贝传参（读 numpy buffer 指针，Rust 读期间 numpy 存活）。
-//! 出参 ids/dists/get_kv 强制拷贝为 owned Python 对象（E3：不暴露 mmap 指针 view，
-//! 跨 FFI 零拷贝生命周期未解，Python GC 释放包装致 Arc 归零后悬垂 → use-after-free）。
+//! Thin wrapper over fs-core, no business logic.
+//! Input vectors: numpy.ndarray f32 contiguous, passed zero-copy (reads the numpy buffer
+//! pointer; numpy must stay alive while Rust reads it).
+//! Outputs ids/dists/get_kv: forced copy into owned Python objects (E3: no mmap pointer
+//! view exposed; cross-FFI zero-copy lifetimes are unsolved — Python GC freeing the wrapper
+//! would drop the Arc to zero and dangle -> use-after-free).
 //!
-//! API：
-//!   store = fusion_store.Store.open(path, dim=None)   # dim=Some→create 锁 schema；None→reopen
+//! API:
+//!   store = fusion_store.Store.open(path, dim=None)   # dim=Some -> create (locks schema); None -> reopen
 //!   store.put_kv(key: bytes, value: bytes)
-//!   store.get_kv(key: bytes) -> bytes | None          # 强制拷贝
-//!   store.insert_vector(id: int, vec: np.ndarray)     # numpy 入参零拷贝
+//!   store.get_kv(key: bytes) -> bytes | None          # forced copy
+//!   store.insert_vector(id: int, vec: np.ndarray)     # numpy input zero-copy
 //!   store.search_knn(query: np.ndarray, top_k: int, timeout_ms: int|None) -> (ids, dists)
-//!                                                      # 出参 numpy 强制拷贝（E3）
-//!   store.delete_vector(id: int) -> bool              # 软删，True=删了存活向量（#2）
-//!   store.get_vector(id: int) -> list[float] | None   # 强制拷贝，missing/已软删→None（#3）
-//!   store.list_vector_ids() -> list[int]              # 存活（非软删）id（#3）
+//!                                                      # outputs numpy forced copy (E3)
+//!   store.delete_vector(id: int) -> bool              # soft delete; True = live vector deleted (#2)
+//!   store.get_vector(id: int) -> list[float] | None   # forced copy; missing/soft-deleted -> None (#3)
+//!   store.list_vector_ids() -> list[int]              # live (non-soft-deleted) ids (#3)
 //!   store.checkpoint()
 //!   store.vector_dim() -> int
 
@@ -27,7 +29,7 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyList, PyTuple};
 
-/// Python 句柄 —— 持 Engine（聚合 KV+向量+列式+WAL，F1/A2）
+/// Python handle — owns an Engine (aggregated KV + vector + columnar + WAL, F1/A2)
 #[pyclass(name = "Store")]
 pub struct PyStore {
     engine: Engine,
@@ -36,8 +38,8 @@ pub struct PyStore {
 #[pymethods]
 impl PyStore {
     /// Store.open(path, dim=None)
-    /// dim=Some → create（锁 schema dim，建向量索引）；dim=None → reopen（从持久化 schema 恢复）
-    /// 经 Engine::open 自动 recover（A1）+ WAL 接入写路径（F2）
+    /// dim=Some -> create (locks schema dim, builds the vector index); dim=None -> reopen (restored from the persisted schema)
+    /// Engine::open runs automatic recover (A1) + WAL is wired into the write path (F2)
     #[staticmethod]
     #[pyo3(signature = (path, dim=None))]
     fn open(path: &str, dim: Option<usize>) -> PyResult<Self> {
@@ -52,14 +54,15 @@ impl PyStore {
         Ok(PyStore { engine })
     }
 
-    /// 写 KV。经 Engine → WAL（fsync）→ mmap 段（F2）。
+    /// Write KV. Engine -> WAL (fsync) -> mmap segment (F2).
     fn put_kv(&self, key: &[u8], value: &[u8]) -> PyResult<()> {
         self.engine.put_kv(key, value, None).map_err(map_err_map)?;
         Ok(())
     }
 
-    /// 读 KV（强制拷贝，E3）→ 返回 owned bytes 或 None。
-    /// 不暴露 mmap 指针 view：返回的 PyBytes 是拷贝，Python GC 释放无悬垂。
+    /// Read KV (forced copy, E3) -> returns owned bytes or None.
+    /// No mmap pointer view exposed: the returned PyBytes is a copy, so Python GC freeing
+    /// it never dangles.
     fn get_kv<'py>(&self, py: Python<'py>, key: &[u8]) -> PyResult<Bound<'py, PyAny>> {
         match self
             .engine
@@ -68,7 +71,7 @@ impl PyStore {
         {
             Some(buf) => {
                 let bytes = buf.as_bytes();
-                // 强制拷贝到 PyBytes（E3）：buf.as_bytes() 落 mmap 区，拷出 owned
+                // Forced copy into PyBytes (E3): buf.as_bytes() lives in the mmap region, copy out owned bytes
                 let owned = bytes.to_vec();
                 tracing::debug!(len = owned.len(), "py get_kv forced-copy");
                 Ok(PyBytes::new(py, &owned).into_any())
@@ -77,8 +80,8 @@ impl PyStore {
         }
     }
 
-    /// 插入向量（numpy 入参零拷贝读 buffer，E3 入参方向）。
-    /// 经 Engine → WAL（payload 完整 vector）→ 落段连边（F2）。
+    /// Insert a vector (numpy input read zero-copy from the buffer, E3 input direction).
+    /// Engine -> WAL (payload carries the full vector) -> segment write + edge linking (F2).
     fn insert_vector(&self, py: Python<'_>, id: u64, vec: PyBuffer<f32>) -> PyResult<()> {
         let buf = vec.as_slice(py).ok_or_else(|| {
             PyRuntimeError::new_err("vec must be C-contiguous float32 numpy array")
@@ -90,8 +93,8 @@ impl PyStore {
         Ok(())
     }
 
-    /// KNN 检索（出参强制拷贝，E3）。
-    /// 经 Engine → 向量索引零拷贝读。返回 (ids, dists) 为 owned Python tuple of list。
+    /// KNN search (forced-copy outputs, E3).
+    /// Engine -> zero-copy vector index read. Returns (ids, dists) as an owned Python tuple of lists.
     #[pyo3(signature = (query, top_k, timeout_ms=None))]
     fn search_knn<'py>(
         &self,
@@ -109,7 +112,7 @@ impl PyStore {
             .engine
             .search_knn(&q, top_k, timeout)
             .map_err(map_err_map)?;
-        // 出参强制拷贝（E3）：建 owned list，非 mmap view
+        // Forced-copy outputs (E3): build owned lists, not mmap views
         let ids: Vec<u64> = results.iter().map(|(id, _)| *id).collect();
         let dists: Vec<f32> = results.iter().map(|(_, d)| *d).collect();
         let ids_list = PyList::new(py, ids)?;
@@ -118,13 +121,13 @@ impl PyStore {
         Ok(tup.into_any())
     }
 
-    /// checkpoint：图 snapshot + KV flush + WAL marker 推进 applied_seq + 截断 WAL（L6）。
+    /// Checkpoint: graph snapshot + KV flush + WAL marker advancing applied_seq + WAL truncation (L6).
     fn checkpoint(&self) -> PyResult<()> {
         self.engine.checkpoint().map_err(map_err_map)?;
         Ok(())
     }
 
-    /// 返回向量维度（供 caller 校验 buffer 大小）。
+    /// Return the vector dimension (so callers can size buffers).
     fn vector_dim(&self) -> usize {
         match self.engine.vec_index() {
             Ok(g) => g.as_ref().unwrap().schema().dim,
@@ -132,7 +135,7 @@ impl PyStore {
         }
     }
 
-    /// 返回当前向量数。
+    /// Return the current vector count.
     fn vector_count(&self) -> usize {
         match self.engine.vec_index() {
             Ok(g) => g.as_ref().unwrap().len(),
@@ -140,20 +143,20 @@ impl PyStore {
         }
     }
 
-    /// 删除向量（软删 tombstone，向量字节由 compact COW 回收）。返回 True=删了存活向量，
-    /// False=id 不存在或已删（#2）。
+    /// Delete a vector (soft-delete tombstone; vector bytes are reclaimed by compact COW).
+    /// Returns True = live vector deleted, False = id missing or already deleted (#2).
     fn delete_vector(&self, id: u64) -> PyResult<bool> {
         let deleted = self.engine.delete_vector(id, None).map_err(map_err_map)?;
         tracing::info!(id, deleted, "py delete_vector");
         Ok(deleted)
     }
 
-    /// 按 id 取单向量（强制拷贝，E3）→ 返回 list[float] 或 None（#3）。
-    /// id 不存在或已软删 → None。owned list 非 mmap view。
+    /// Fetch a single vector by id (forced copy, E3) -> returns list[float] or None (#3).
+    /// Missing or soft-deleted id -> None. Owned list, not an mmap view.
     fn get_vector<'py>(&self, py: Python<'py>, id: u64) -> PyResult<Bound<'py, PyAny>> {
         match self.engine.get_vector(id, None).map_err(map_err_map)? {
             Some(v) => {
-                // 强制拷贝到 owned Python list（E3）：非 mmap view
+                // Forced copy into an owned Python list (E3): not an mmap view
                 tracing::debug!(id, len = v.len(), "py get_vector forced-copy");
                 let list = PyList::new(py, v)?;
                 Ok(list.into_any())
@@ -162,7 +165,7 @@ impl PyStore {
         }
     }
 
-    /// 枚举存活（非软删）向量 id → owned list[int]（#3，E3 强制拷贝）。
+    /// Enumerate live (non-soft-deleted) vector ids -> owned list[int] (#3, E3 forced copy).
     fn list_vector_ids(&self) -> PyResult<Vec<u64>> {
         let ids = self.engine.list_vector_ids(None).map_err(map_err_map)?;
         tracing::debug!(count = ids.len(), "py list_vector_ids");
@@ -175,7 +178,7 @@ fn map_err_map(e: fs_core::StoreError) -> PyErr {
     PyRuntimeError::new_err(format!("{e:?}"))
 }
 
-/// 展开 ~ 为 $HOME（Python 侧路径常含 ~）
+/// Expand ~ to $HOME (Python-side paths often contain ~)
 fn expand_tilde(path: &str) -> String {
     if let Some(rest) = path.strip_prefix('~') {
         if let Some(home) = std::env::var_os("HOME") {
@@ -190,11 +193,14 @@ fn expand_tilde(path: &str) -> String {
 
 #[pymodule]
 fn fusion_store(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
-    // tracing 初始化（幂等，env-filter）
+    // tracing init (idempotent, env-filter)
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init();
     m.add_class::<PyStore>()?;
-    m.setattr("__doc__", "fusion-store Python 绑定（PyO3，读强制拷贝 E3）")?;
+    m.setattr(
+        "__doc__",
+        "fusion-store Python bindings (PyO3, forced-copy reads E3)",
+    )?;
     Ok(())
 }

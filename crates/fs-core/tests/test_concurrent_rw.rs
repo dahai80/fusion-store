@@ -1,7 +1,7 @@
-//! M2 集成：并发读写 [v2 A1/R5]
+//! M2 integration: concurrent read/write [v2 A1/R5]
 //!
-//! 多线程并发 insert + search_knn，验证 RwLock 图无死锁、无 panic、
-//! 读不阻塞读、写不撕裂结果。delete 与 search 并发不 panic。
+//! Multi-threaded concurrent insert + search_knn, verifying the RwLock graph has no deadlock, no panic,
+//! reads don't block reads, writes never tear results. Concurrent delete + search never panics.
 
 use std::sync::Arc;
 use std::thread;
@@ -23,7 +23,7 @@ fn concurrent_insert_and_search_no_deadlock() {
 
     let mut handles = Vec::new();
 
-    // writers：每线程写 OPS 个向量，id 不重叠
+    // writers: each thread writes OPS vectors, non-overlapping ids
     for w in 0..WRITERS {
         let idx = idx.clone();
         handles.push(thread::spawn(move || {
@@ -35,14 +35,14 @@ fn concurrent_insert_and_search_no_deadlock() {
             }
         }));
     }
-    // readers：并发 search
+    // readers: concurrent search
     for _ in 0..READERS {
         let idx = idx.clone();
         handles.push(thread::spawn(move || {
             for _ in 0..OPS {
                 let q = vec![1.0f32; DIM];
                 let res = idx.search_knn(&q, 10, None).unwrap();
-                // 仅校验不 panic、不死锁
+                // Only verify no panic, no deadlock
                 let _ = res.len();
             }
         }));
@@ -50,7 +50,7 @@ fn concurrent_insert_and_search_no_deadlock() {
     for h in handles {
         h.join().expect("thread panicked");
     }
-    // 全部写完，总数 = WRITERS * OPS
+    // All writes done, total = WRITERS * OPS
     assert_eq!(idx.len(), WRITERS * OPS);
 }
 
@@ -59,7 +59,7 @@ fn concurrent_delete_and_search_no_panic() {
     let dir = tempdir().unwrap();
     let schema = VectorSchema::new(DIM, MetricKind::L2);
     let idx = Arc::new(VectorIndex::open(dir.path(), schema, 0).unwrap());
-    // 预写
+    // Pre-populate
     for i in 0..500u64 {
         let mut v = vec![0.0f32; DIM];
         v[0] = i as f32;
@@ -82,6 +82,6 @@ fn concurrent_delete_and_search_no_panic() {
     for h in handles {
         h.join().expect("thread panicked");
     }
-    // 删完后 len=0
+    // After all deletes, len=0
     assert_eq!(idx.len(), 0);
 }

@@ -1,21 +1,29 @@
-//! ShardedEngine —— NSW 规模演进 Path A 分片薄层 [ROADMAP F-ARCH-3]
+//! ShardedEngine — NSW scale-evolution Path A thin sharding layer [ROADMAP F-ARCH-3]
 //!
-//! 单层 NSW 单 namespace 软上限 ≤1-2M 向量。Path A 不改 `NswGraph` 核心算法，
-//! 在 Engine 之上加薄分片层：一个逻辑库拆 K 个 namespace（各独立 `Engine::open`
-//! 目录 + 独立 WAL + 独立 flock），向量按 id 分片路由，检索 fan-out 并行查 K 分片
-//! 后归并全局 top-k。
+//! A single-layer NSW has a soft ceiling of roughly 1-2M vectors per namespace. Path A
+//! does not touch the `NswGraph` core algorithm; instead it adds a thin sharding layer
+//! above Engine: one logical library split into K namespaces (each with its own
+//! `Engine::open` directory + independent WAL + independent flock). Vectors are routed
+//! to shards by id; search fans out and queries the K shards in parallel, then merges
+//! the global top-k.
 //!
-//! 设计要点：
-//! - **薄层非核心改动**：持 `Vec<Engine>`，路由方法分派，不碰 `NswGraph`/WAL/mmap。
-//! - **完整 impl `FusionStoreEngine`**：对消费方透明，一个句柄操作整个分片库。
-//! - **路由策略可注入**：`ShardRouter` trait，默认 `HashRouter`（id % K / key fnv % K）。
-//!   消费方可注入业务键路由（如按 tenant 固定分片，免 fan-out）。
-//! - **fan-out 并行**：`std::thread::scope` 并行查 K 分片，归并取全局 top-k。
-//!   Engine 内部同步 mmap，无 async；线程并行是 fan-out 延迟最优解（Rule 5：确定性分派，不经模型）。
+//! Design points:
+//! - **Thin layer, no core changes**: holds `Vec<Engine>` and dispatches via routing
+//!   methods; never touches `NswGraph`/WAL/mmap.
+//! - **Full impl of `FusionStoreEngine`**: transparent to consumers — one handle operates
+//!   the entire sharded library.
+//! - **Injectable routing strategy**: the `ShardRouter` trait, defaulting to `HashRouter`
+//!   (id % K / key fnv % K). Consumers can inject business-key routing (e.g. pin shards
+//!   by tenant to avoid fan-out).
+//! - **Parallel fan-out**: `std::thread::scope` queries the K shards in parallel and
+//!   merges the global top-k. Engine is synchronous mmap internally, no async; thread
+//!   parallelism is the latency-optimal fan-out (Rule 5: deterministic dispatch, not
+//!   through a model).
 //!
-//! A4 立场不变：单 `Engine` 仍是单 namespace。ShardedEngine 是消费方侧多 Engine 编排，
-//! 非单引擎内多 namespace 路由。K 增长时 fd/mmap/进程数随之膨胀，触及 macOS 系统上限
-//! 由消费方控制（同 A4 文档化约束）。
+//! A4 stance unchanged: a single `Engine` remains single-namespace. ShardedEngine is
+//! consumer-side multi-Engine orchestration, not multi-namespace routing inside one
+//! engine. As K grows, fd/mmap/process counts grow with it; hitting macOS system limits
+//! is the consumer's concern (same documented constraint as A4).
 
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -33,16 +41,16 @@ use crate::engine::ZeroCopyArrowBatch;
 #[cfg(feature = "columnar")]
 use arrow::record_batch::RecordBatch as ArrowRecordBatch;
 
-// —— 路由策略 ——
+// —— Routing strategy ——
 
-/// 分片路由策略 —— 决定向量 id / KV key 落到哪个分片。
+/// Shard routing strategy — decides which shard a vector id / KV key lands on.
 pub trait ShardRouter: Send + Sync {
     fn shard_for_vector(&self, id: u64, num_shards: usize) -> usize;
     fn shard_for_key(&self, key: &[u8], num_shards: usize) -> usize;
 }
 
-/// 默认路由：向量按 id 取模，KV 按 key fnv-1a hash 取模。
-/// 确定性、均匀分布、无状态（Rule 5）。
+/// Default routing: vectors by id modulo, KV by key fnv-1a hash modulo.
+/// Deterministic, uniformly distributed, stateless (Rule 5).
 pub struct HashRouter;
 
 impl ShardRouter for HashRouter {
@@ -65,7 +73,7 @@ impl ShardRouter for HashRouter {
 
 // —— ShardedEngine ——
 
-/// 分片引擎 —— 持 K 个 `Engine`，路由分派 + fan-out 检索归并。
+/// Sharded engine — holds K `Engine`s, dispatches by routing + merges fan-out search.
 pub struct ShardedEngine {
     shards: Vec<Engine>,
     home: PathBuf,
@@ -73,9 +81,10 @@ pub struct ShardedEngine {
 }
 
 impl ShardedEngine {
-    /// 打开/创建分片引擎。home 下建 `shard_0`..`shard_{num_shards-1}` 子目录，
-    /// 各开独立 `Engine::open`。schema=Some → 每分片建同 schema 向量索引；None → 全部重开。
-    /// 打开后各分片自动 recover（独立 WAL 重放）。
+    /// Open/create the sharded engine. Creates `shard_0`..`shard_{num_shards-1}`
+    /// subdirectories under home, each opening its own `Engine::open`. schema=Some →
+    /// build a vector index with the same schema per shard; None → reopen all.
+    /// After opening, each shard automatically recovers (independent WAL replay).
     pub fn open(
         home: &Path,
         num_shards: usize,
@@ -85,7 +94,7 @@ impl ShardedEngine {
         Self::open_with_router(home, num_shards, schema, quota_limit, Arc::new(HashRouter))
     }
 
-    /// 注入自定义路由策略建分片引擎。
+    /// Build the sharded engine with an injected custom routing strategy.
     pub fn open_with_router(
         home: &Path,
         num_shards: usize,
@@ -100,7 +109,7 @@ impl ShardedEngine {
         let mut shards = Vec::with_capacity(num_shards);
         for i in 0..num_shards {
             let shard_dir = home.join(format!("shard_{}", i));
-            // schema=Some 每分片建同 schema（各 clone，建独立索引）；None 全部重开
+            // schema=Some builds the same schema per shard (each cloned, independent indexes); None reopens all
             let s = schema.clone();
             let engine = Engine::open(&shard_dir, s, quota_limit)?;
             shards.push(engine);
@@ -113,29 +122,29 @@ impl ShardedEngine {
         })
     }
 
-    /// 分片数。
+    /// Number of shards.
     pub fn num_shards(&self) -> usize {
         self.shards.len()
     }
 
-    /// 分片引擎根目录。
+    /// Sharded engine root directory.
     pub fn home(&self) -> &Path {
         &self.home
     }
 
-    /// 按向量 id 路由到分片引用。
+    /// Route a vector id to a shard reference.
     fn shard_for_vector(&self, id: u64) -> &Engine {
         let idx = self.router.shard_for_vector(id, self.shards.len());
         &self.shards[idx]
     }
 
-    /// 按 KV key 路由到分片引用。
+    /// Route a KV key to a shard reference.
     fn shard_for_key(&self, key: &[u8]) -> &Engine {
         let idx = self.router.shard_for_key(key, self.shards.len());
         &self.shards[idx]
     }
 
-    /// 全分片磁盘占用之和。
+    /// Sum of disk usage across all shards.
     pub fn disk_bytes(&self) -> Result<u64> {
         let mut total: u64 = 0;
         for s in &self.shards {
@@ -144,7 +153,8 @@ impl ShardedEngine {
         Ok(total)
     }
 
-    /// 向量总数（全分片存活 id 之和）。分片未建向量索引时该分片计 0。
+    /// Total vector count (sum of live ids across all shards). A shard without a vector
+    /// index counts 0.
     pub fn vector_count(&self) -> Result<u64> {
         let mut total: u64 = 0;
         for s in &self.shards {
@@ -176,7 +186,7 @@ impl FusionStoreEngine for ShardedEngine {
     }
 
     fn create_vector_index(&self, name: &str, schema: VectorSchema) -> Result<()> {
-        // 每分片建同 schema 向量索引（name 仅日志）
+        // Build a same-schema vector index per shard (name is logging-only)
         for (i, s) in self.shards.iter().enumerate() {
             s.create_vector_index(name, schema.clone())?;
             tracing::debug!(shard = i, "sharded: vector index created on shard");
@@ -185,7 +195,7 @@ impl FusionStoreEngine for ShardedEngine {
     }
 
     fn open_vector_index(&self, name: &str) -> Result<VectorSchema> {
-        // 各分片 schema 一致（建时同步），取首分片即可
+        // All shards share the same schema (synchronized at creation); the first shard suffices
         self.shards[0].open_vector_index(name)
     }
 
@@ -198,9 +208,12 @@ impl FusionStoreEngine for ShardedEngine {
         items: &[(u64, &[f32])],
         timeout: Option<Duration>,
     ) -> Result<()> {
-        // 按 id 路由分摊到各分片，各分片攒批后单次 insert_vector_batch（group commit）。
-        // 不做跨分片原子：单条 insert 各自 WAL fsync，分摊后各分片独立持久化。
-        // 跨分片原子需 2PC，超出薄层范围（Rule 2），消费方按业务容忍。
+        // Route by id into per-shard buckets, then each shard commits one
+        // insert_vector_batch (group commit).
+        // No cross-shard atomicity: individual inserts each WAL fsync, and after bucketing
+        // each shard persists independently.
+        // Cross-shard atomicity would need 2PC — out of scope for a thin layer (Rule 2);
+        // consumers tolerate this per their business semantics.
         let mut buckets: Vec<Vec<(u64, &[f32])>> = vec![Vec::new(); self.shards.len()];
         for (id, v) in items {
             let idx = self.router.shard_for_vector(*id, self.shards.len());
@@ -221,9 +234,12 @@ impl FusionStoreEngine for ShardedEngine {
         top_k: usize,
         timeout: Option<Duration>,
     ) -> Result<Vec<(u64, f32)>> {
-        // fan-out：并行查 K 分片，各返 top_k 候选，归并取全局 top_k。
-        // 各分片返已按 dist 升序排列；全局归并 = 收集 K×top_k 候选排序取前 K（Rule 2：简单正确，
-        // K×top_k 规模可控，非海量）。线程并行 fan-out 降延迟（max(分片延迟) 而非 sum）。
+        // fan-out: query the K shards in parallel, each returning top_k candidates, then
+        // merge into the global top_k.
+        // Each shard returns candidates already sorted ascending by dist; the global merge
+        // = collect K×top_k candidates, sort, take the top (Rule 2: simple and correct;
+        // K×top_k is bounded, not massive). Thread-parallel fan-out cuts latency
+        // (max(shard latencies) instead of sum).
         if self.shards.len() == 1 {
             return self.shards[0].search_knn(query_vector, top_k, timeout);
         }
@@ -244,7 +260,7 @@ impl FusionStoreEngine for ShardedEngine {
             }
             all
         });
-        // 升序排序取前 top_k（dist 越小越近）
+        // Sort ascending and take the top_k (smaller dist = nearer)
         results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         results.truncate(top_k);
         Ok(results)
@@ -259,7 +275,7 @@ impl FusionStoreEngine for ShardedEngine {
     }
 
     fn list_vector_ids(&self, _timeout: Option<Duration>) -> Result<Vec<u64>> {
-        // 全分片合并存活 id。单分片快路径
+        // Merge live ids across all shards. Single-shard fast path
         let mut all = Vec::new();
         for s in &self.shards {
             all.extend(s.list_vector_ids(_timeout)?);
@@ -274,7 +290,8 @@ impl FusionStoreEngine for ShardedEngine {
         batch: &ArrowRecordBatch,
         timeout: Option<Duration>,
     ) -> Result<()> {
-        // 列式按 table_id 路由（key 语义）。table_id 作分片键，同表落同分片。
+        // Columnar routes by table_id (key semantics). table_id is the shard key so the
+        // same table always lands on the same shard.
         let idx = self
             .router
             .shard_for_key(table_id.as_bytes(), self.shards.len());
@@ -295,7 +312,8 @@ impl FusionStoreEngine for ShardedEngine {
     }
 
     fn checkpoint(&self) -> Result<()> {
-        // 全分片顺序 checkpoint。任一分片失败 → 立即返回 Err（部分 checkpoint，消费方重试）
+        // Checkpoint all shards sequentially. Any shard failure → return Err immediately
+        // (partial checkpoint; the consumer retries)
         for (i, s) in self.shards.iter().enumerate() {
             s.checkpoint().map_err(|e| {
                 tracing::error!(shard = i, error = ?e, "sharded checkpoint: shard failed");
@@ -317,7 +335,8 @@ impl FusionStoreEngine for ShardedEngine {
     }
 
     fn close(&self) -> Result<()> {
-        // 全分片顺序关闭。任一失败 → 返回 Err（后续分片未关闭，消费方需处理）
+        // Close all shards sequentially. Any failure → return Err (later shards unclosed;
+        // the consumer must handle it)
         for (i, s) in self.shards.iter().enumerate() {
             s.close().map_err(|e| {
                 tracing::error!(shard = i, error = ?e, "sharded close: shard failed");

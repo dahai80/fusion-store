@@ -1,9 +1,12 @@
-//! L-INDEX 向量索引层（单层 NSW 图常驻 RAM + NEON SIMD）[v2 H1/R4]
+//! L-INDEX vector index layer (single-layer NSW graph resident in RAM + NEON SIMD) [v2 H1/R4]
 //!
-//! A2 诚实命名：本层实现是**单层 NSW**（邻接图，无多层跳表），非真 HNSW。
-//! 检索复杂度近似 O(N^log M)，非多层 HNSW 的 O(log N)。N 持续增长会击穿
-//! p99<5ms SLA（README 全规模基准节有扩展上限说明）。命名从 `HnswGraph`/`hnsw`
-//! 改为 `NswGraph`/`nsw` 以匹配实现，不再对外宣传 HNSW。
+//! A2 honest naming: this layer implements a **single-layer NSW** (adjacency
+//! graph, no multi-layer skip list), not a true HNSW. Search complexity is
+//! approximately O(N^log M), not multi-layer HNSW's O(log N). Unbounded growth
+//! of N will eventually breach the p99<5ms SLA (see the full-scale benchmark
+//! section in the README for scaling limits). Names changed from
+//! `HnswGraph`/`hnsw` to `NswGraph`/`nsw` to match the implementation, so we no
+//! longer advertise HNSW externally.
 
 pub mod nsw;
 pub mod schema;

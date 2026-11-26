@@ -1,31 +1,34 @@
-//! Recover —— WAL 幂等重放 [v2 §2.7/R2]
+//! Recover — idempotent WAL replay [v2 §2.7/R2]
 //!
-//! recover 流程（PRD §2.7）：
-//!   1. 读 checkpoint.marker.applied_seq
-//!   2. 读 WAL，取 seq > applied_seq 的条目（F5：torn-tail 容错）
-//!   3. 重放：幂等（insert 查 id 存在性跳过，put_kv 覆盖，delete 幂等）
-//!   4. 重放完截断 WAL
+//! Recover flow (PRD §2.7):
+//!   1. Read checkpoint.marker.applied_seq
+//!   2. Read the WAL and take entries with seq > applied_seq (F5: torn-tail tolerance)
+//!   3. Replay idempotently (insert skips existing ids, put_kv overwrites, delete is idempotent)
+//!   4. Truncate the WAL after replay
 //!
-//! 逻辑 WAL（F2）后不再做物理块登记回滚：重放经子模块幂等方法重新落段，
-//! 旧段空字节的回收由 compact 负责，而非 recover 回滚未登记块。recover 仅产
-//! 待重放条目 plan，引擎层消费执行重放（Rule 3 外科式：不入侵现有 store）。
+//! Since the logical WAL (F2), no physical block-registration rollback happens: replay
+//! re-lands data through submodule idempotent methods, and reclaiming freed bytes in old
+//! segments is compact's job, not recover rolling back unregistered blocks. Recover only
+//! produces the pending-replay plan; the engine layer consumes and executes it
+//! (Rule 3 surgical: no invasion of the existing store).
 
 use std::path::Path;
 
 use crate::error::Result;
 use crate::mem::wal::{Wal, WalEntry};
 
-/// recover 产出的重放计划 —— 引擎层消费
+/// Replay plan produced by recover — consumed by the engine layer
 #[derive(Debug, Default)]
 pub struct RecoverPlan {
-    /// 待重放条目（seq 升序，已过滤 seq > applied_seq）
+    /// Entries pending replay (ascending seq, filtered to seq > applied_seq)
     pub entries: Vec<WalEntry>,
-    /// checkpoint 的 applied_seq
+    /// applied_seq recorded at the checkpoint
     pub applied_seq: u64,
 }
 
-/// 执行 recover 前半段：读 marker + 过滤待重放条目。
-/// 不截断 WAL（截断在引擎确认重放成功后调 finalize_recover）。
+/// Run the first half of recover: read the marker and filter pending entries.
+/// Does not truncate the WAL (truncation happens via finalize_recover after the
+/// engine confirms replay succeeded).
 pub fn build_recover_plan(wal_dir: &Path) -> Result<RecoverPlan> {
     let wal = Wal::open(wal_dir)?;
     let applied_seq = match wal.read_marker()? {
@@ -50,7 +53,7 @@ pub fn build_recover_plan(wal_dir: &Path) -> Result<RecoverPlan> {
     })
 }
 
-/// 重放完确认后截断 WAL（防无限增长）
+/// Truncate the WAL after replay is confirmed (prevents unbounded growth)
 pub fn finalize_recover(wal_dir: &Path, applied_seq: u64) -> Result<()> {
     let mut wal = Wal::open(wal_dir)?;
     wal.truncate_to(applied_seq)
@@ -99,7 +102,7 @@ mod tests {
         }
         let plan = build_recover_plan(&wal_dir).unwrap();
         assert_eq!(plan.applied_seq, 2);
-        // 只重放 seq 3,4
+        // replay only seq 3,4
         assert_eq!(plan.entries.len(), 2);
         assert_eq!(plan.entries[0].seq, 3);
         assert_eq!(plan.entries[1].seq, 4);
@@ -150,7 +153,7 @@ mod tests {
 
     #[test]
     fn double_recover_plan_is_idempotent() {
-        // R2：重复 recover plan 完全一致（纯读，无累积）
+        // R2: repeated recover plans are fully identical (pure read, no accumulation)
         let dir = tempdir().unwrap();
         let wal_dir = dir.path().to_path_buf();
         {

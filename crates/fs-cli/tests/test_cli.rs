@@ -1,7 +1,8 @@
-//! fs-cli 集成测试 —— 真实子进程跑二进制 [v2 M4d/E4]
+//! fs-cli integration tests — real binary via subprocess [v2 M4d/E4]
 //!
-//! 不 mock：cargo 编译 fs-cli，测试用 std::process::Command 起子进程，
-//! 各子命令真实落盘 + 校验输出。CARGO_BIN_EXE_fs-cli 给出二进制路径。
+//! No mocks: cargo builds fs-cli and the tests spawn a subprocess with
+//! std::process::Command; every subcommand really hits disk and its output is verified.
+//! CARGO_BIN_EXE_fs-cli provides the binary path.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -68,7 +69,7 @@ fn stats_reports_namespace_state() {
 
 #[test]
 fn compact_runs_on_empty_namespace() {
-    // compact 空索引 noop（不 panic）
+    // compact on an empty index is a no-op (no panic)
     let dir = tempdir().unwrap();
     let home = dir.path().to_path_buf();
     run(&home, &["init", "--namespace", "ns4", "--dim", "4"]);
@@ -83,7 +84,7 @@ fn compact_runs_on_empty_namespace() {
 
 #[test]
 fn recover_dry_run_on_fresh_namespace() {
-    // 新 ns 无 WAL 待重放，dry_run 报 nothing
+    // a fresh ns has no WAL entries pending; dry_run reports nothing
     let dir = tempdir().unwrap();
     let home = dir.path().to_path_buf();
     run(&home, &["init", "--namespace", "ns5", "--dim", "4"]);

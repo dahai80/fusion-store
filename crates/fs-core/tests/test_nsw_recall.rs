@@ -1,10 +1,10 @@
-//! M2 集成：NSW 召回率 + 延迟 [v2 R4/M2 验收]
+//! M2 integration: NSW recall + latency [v2 R4/M2 acceptance]
 //!
-//! 召收率：NSW KNN vs 暴力 KNN，top-10 重合率。
-//! 延迟：单次 search_knn p99 < 5ms（PRD 降规模验证趋势，1M×768 留 M4 基准）。
-//! 规模：1000×128 f32，足证图连边 + 跳转正确性。
-//! A2：本引擎向量索引是单层 NSW（非 HNSW）。延迟 SLA 是 release 指标，debug 未优化
-//! 且并行测试争用会致 p99 抖动假阴 → debug 只测不断言，release（--release / CI）严格断言。
+//! Recall: NSW KNN vs brute-force KNN, top-10 overlap rate.
+//! Latency: single search_knn p99 < 5ms (PRD reduced-scale trend check; 1M×768 left to the M4 benchmark).
+//! Scale: 1000×128 f32, sufficient to prove graph linking + traversal correctness.
+//! A2: this engine's vector index is a single-layer NSW (not HNSW). The latency SLA is a release metric; debug builds
+//! are unoptimized and parallel-test contention causes p99 jitter false negatives → debug only measures, release (--release / CI) asserts strictly.
 
 use std::time::{Duration, Instant};
 
@@ -18,7 +18,7 @@ const DIM: usize = 128;
 const TOP_K: usize = 10;
 
 fn gen_vectors(n: usize, dim: usize, seed: u64) -> Vec<Vec<f32>> {
-    // 简单确定性伪随机（不依赖 Math.random，可复现）
+    // Simple deterministic pseudo-random (no Math.random dependency, reproducible)
     let mut v = Vec::with_capacity(n);
     let mut s = seed;
     for i in 0..n {
@@ -49,7 +49,7 @@ fn nsw_recall_vs_bruteforce_top10() {
         .collect();
     idx.insert_batch(&items, None).unwrap();
 
-    // 暴力 top-10
+    // Brute-force top-10
     let query = &vecs[123];
     let mut brute: Vec<(u64, f32)> = (0..N)
         .map(|i| (i as u64, simd::distance(MetricKind::L2, query, &vecs[i])))
@@ -93,8 +93,8 @@ fn knn_latency_p99_under_5ms() {
     latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let p99 = latencies[(latencies.len() as f64 * 0.99) as usize];
     eprintln!("knn p99 = {:.0}us (n={}, dim={})", p99, N, DIM);
-    // 延迟 SLA 是 release 指标；debug 未优化 + 并行测试 CPU 争用致 p99 抖动假阴。
-    // debug 只测不断言，release（--release / CI）严格断言（实测 ~3340us，~50% 余量）。
+    // Latency SLA is a release metric; unoptimized debug + parallel-test CPU contention cause p99 jitter false negatives.
+    // Debug only measures, release (--release / CI) asserts strictly (measured ~3340us, ~50% headroom).
     #[cfg(not(debug_assertions))]
     assert!(p99 < 5000.0, "p99 {}us >= 5000us", p99);
     #[cfg(debug_assertions)]
@@ -103,7 +103,7 @@ fn knn_latency_p99_under_5ms() {
 
 #[test]
 fn get_vector_and_list_vector_ids_roundtrip() {
-    // #3：get_vector（present/missing/deleted）+ list_vector_ids（排除软删）
+    // #3: get_vector (present/missing/deleted) + list_vector_ids (soft-deleted excluded)
     let dir = tempdir().unwrap();
     let schema = VectorSchema::new(8, MetricKind::L2);
     let idx = VectorIndex::open(dir.path(), schema, 0).unwrap();
@@ -115,23 +115,23 @@ fn get_vector_and_list_vector_ids_roundtrip() {
         .collect();
     idx.insert_batch(&items, None).unwrap();
 
-    // list 20 个
+    // List 20
     let mut ids = idx.list_vector_ids().unwrap();
     ids.sort();
     assert_eq!(ids, (0..20u64).collect::<Vec<_>>());
 
-    // get 存活向量：值 == 插入
+    // Get a live vector: value == inserted
     let got = idx.get_vector(5).unwrap();
     assert_eq!(got.as_ref().unwrap().as_slice(), vecs[5].as_slice());
 
-    // get missing -> None
+    // Get missing -> None
     assert!(idx.get_vector(999).unwrap().is_none());
 
-    // 软删 id=5
+    // Soft-delete id=5
     assert!(idx.delete(5, None).unwrap());
-    // get 删后 -> None
+    // Get after delete -> None
     assert!(idx.get_vector(5).unwrap().is_none());
-    // list 排除 id=5
+    // List excludes id=5
     let mut ids2 = idx.list_vector_ids().unwrap();
     ids2.sort();
     assert_eq!(ids2, (0..20u64).filter(|i| *i != 5).collect::<Vec<_>>());

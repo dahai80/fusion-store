@@ -1,17 +1,18 @@
-//! Crash recovery 端到端集成测试 —— M1 重写 [v2 §2.7/R2/H5/F2]
+//! Crash recovery end-to-end integration tests — M1 rewrite [v2 §2.7/R2/H5/F2]
 //!
-//! 真实经 Engine 写（WAL fsync 唯一同步点 + mmap 段延迟刷，H5/F2），
-//! 模拟 kill-9（drop Engine 无 checkpoint），重开 Engine::open 自动 recover，
-//! 断言数据落盘可读回。替代旧 loc/registered_blocks 单元测试（逻辑 WAL 后物理
-//! 块登记已废弃，recover 经子模块幂等方法重放，不再回滚未登记块）。
+//! Writes go through the real Engine (WAL fsync as the single sync point + mmap segments flushed lazily, H5/F2),
+//! simulates kill-9 (drop Engine without checkpoint), reopens with Engine::open auto-recover,
+//! and asserts data is persisted and readable back. Replaces the old loc/registered_blocks unit tests
+//! (physical block registration after the logical WAL is deprecated; recover replays via submodule idempotent
+//! methods and no longer rolls back unregistered blocks).
 //!
-//! 验收：
-//!   - 崩溃后重开：KV + 向量全部 recover 可读
-//!   - 重复 open recover 幂等（无累积、insert dup 跳过）
-//!   - checkpoint 后崩溃：marker 生效，仅 tail 重放（已 checkpoint 部分不重放）
-//!   - delete 经 WAL 重放：recover 后 key/id 确实删
-//!   - recover 后 WAL 截断：plan 空，再开无重放
-//!   - seq 单调续号
+//! Acceptance:
+//!   - Reopen after crash: all KV + vectors recovered and readable
+//!   - Repeated open-recover is idempotent (no accumulation, insert dup skipped)
+//!   - Crash after checkpoint: marker takes effect, only the tail is replayed (checkpointed portion not replayed)
+//!   - Deletes replayed via WAL: key/id actually gone after recover
+//!   - WAL truncated after recover: plan empty, no replay on next open
+//!   - seq continues monotonically
 
 use fs_core::mem::build_recover_plan;
 use fs_core::vector::schema::{MetricKind, VectorSchema};
@@ -22,16 +23,16 @@ fn schema(dim: usize) -> VectorSchema {
     VectorSchema::new(dim, MetricKind::L2)
 }
 
-// ---- 占位：各测试用 Edit 填充 ----
+// ---- Placeholder: each test filled in via Edit ----
 
-/// kill-9：写 KV+向量 → drop（无 checkpoint）→ 重开 recover → 全部可读
+/// kill-9: write KV+vectors → drop (no checkpoint) → reopen and recover → all readable
 #[test]
 fn crash_without_checkpoint_recovers_all_writes() {
     let dir = tempdir().unwrap();
     let home = dir.path().join("ns");
     let dim = 4usize;
 
-    // phase 1：经 Engine 写（WAL fsync），不 checkpoint，drop 模拟 crash
+    // phase 1: write via Engine (WAL fsync), no checkpoint, drop simulates crash
     {
         let engine = Engine::open(&home, Some(schema(dim)), 0).unwrap();
         for i in 0..5u64 {
@@ -42,10 +43,10 @@ fn crash_without_checkpoint_recovers_all_writes() {
             vec[0] = i as f32;
             engine.insert_vector(100 + i, &vec, None).unwrap();
         }
-        // 不 checkpoint，直接 drop —— kill-9
+        // No checkpoint, drop directly — kill-9
     }
 
-    // phase 2：重开 Engine::open 自动 recover，断言数据可读
+    // phase 2: reopen Engine::open auto-recovers, assert data readable
     let engine = Engine::open(&home, None, 0).unwrap();
     for i in 0..5u64 {
         let k = format!("k{}", i);
@@ -55,7 +56,7 @@ fn crash_without_checkpoint_recovers_all_writes() {
         let expect = format!("val{}", i);
         assert_eq!(&owned, expect.as_bytes(), "kv k{} value recovered", i);
     }
-    // 向量 recover：5 条全可检索
+    // Vector recover: all 5 searchable
     let g = engine.vec_index().unwrap();
     let idx = g.as_ref().unwrap();
     assert_eq!(idx.len(), 5, "5 vectors recovered");
@@ -64,14 +65,14 @@ fn crash_without_checkpoint_recovers_all_writes() {
     assert_eq!(hits[0].0, 103, "nearest id=103 recovered");
 }
 
-/// R2：重复 open recover 幂等（insert dup 跳过、put_kv 覆盖，无累积错误）
+/// R2: repeated open-recover is idempotent (insert dup skipped, put_kv overwrites, no accumulation errors)
 #[test]
 fn repeated_reopen_is_idempotent() {
     let dir = tempdir().unwrap();
     let home = dir.path().join("ns");
     let dim = 2usize;
 
-    // phase 1：写 3 向量，crash
+    // phase 1: write 3 vectors, crash
     {
         let engine = Engine::open(&home, Some(schema(dim)), 0).unwrap();
         for i in 0..3u64 {
@@ -79,7 +80,7 @@ fn repeated_reopen_is_idempotent() {
         }
     }
 
-    // 连续 reopen 3 次，每次 recover 幂等：向量数恒 3，无 panic 无累积
+    // Reopen 3 times in a row, each recover idempotent: vector count stays 3, no panic, no accumulation
     for round in 0..3 {
         let engine = Engine::open(&home, None, 0).unwrap();
         let g = engine.vec_index().unwrap();
@@ -87,39 +88,39 @@ fn repeated_reopen_is_idempotent() {
         assert_eq!(idx.len(), 3, "round {}: 3 vectors, no accumulation", round);
     }
 
-    // 末次后 WAL 已截断（finalize_recover 在 open 内调），plan 空
+    // After the last round the WAL is truncated (finalize_recover called inside open), plan empty
     let plan = build_recover_plan(&home.join("wal")).unwrap();
     assert!(plan.entries.is_empty(), "WAL truncated, no pending replay");
 }
 
-/// checkpoint 后 crash：marker 生效，仅 tail 重放
+/// Crash after checkpoint: marker takes effect, only the tail is replayed
 #[test]
 fn crash_after_checkpoint_replays_only_tail() {
     let dir = tempdir().unwrap();
     let home = dir.path().join("ns");
     let dim = 2usize;
 
-    // phase 1：写 4 向量 + checkpoint（marker applied_seq=4，截断 WAL）
+    // phase 1: write 4 vectors + checkpoint (marker applied_seq=4, WAL truncated)
     {
         let engine = Engine::open(&home, Some(schema(dim)), 0).unwrap();
         for i in 0..4u64 {
             engine.insert_vector(i, &[i as f32, 0.0], None).unwrap();
         }
         engine.checkpoint().unwrap();
-        // checkpoint 后继续写 tail（2 条），再 crash
+        // After checkpoint, keep writing the tail (2 ops), then crash
         engine.insert_vector(4, &[4.0, 0.0], None).unwrap();
         engine.put_kv(b"tail_k", b"tail_v", None).unwrap();
     }
 
-    // phase 2：crash 后重开，plan 应只含 tail（marker applied_seq 推进过）
-    // 注意：open 内已 recover+truncate，故此处 plan 应空
+    // phase 2: reopen after crash, plan should only contain the tail (marker applied_seq already advanced)
+    // Note: open already recovered + truncated, so the plan here should be empty
     let engine = Engine::open(&home, None, 0).unwrap();
     let plan_after = engine.pending_recover_plan().unwrap();
     assert!(
         plan_after.entries.is_empty(),
         "tail replayed + truncated on open, no pending"
     );
-    // checkpoint 的 4 向量 + tail 2 向量全在
+    // Checkpointed 4 vectors + tail vectors all present
     let g = engine.vec_index().unwrap();
     let idx = g.as_ref().unwrap();
     assert_eq!(idx.len(), 5, "4 checkpointed + 1 tail vector recovered");
@@ -131,14 +132,14 @@ fn crash_after_checkpoint_replays_only_tail() {
     );
 }
 
-/// delete 经 WAL 重放：recover 后 KV key + 向量 id 确实删
+/// Deletes replayed via WAL: KV key + vector id actually gone after recover
 #[test]
 fn delete_ops_replayed_on_recover() {
     let dir = tempdir().unwrap();
     let home = dir.path().join("ns");
     let dim = 2usize;
 
-    // phase 1：写 KV+向量，再删，crash（删已记 WAL 未 checkpoint）
+    // phase 1: write KV+vectors, then delete, crash (deletes recorded in WAL, not checkpointed)
     {
         let engine = Engine::open(&home, Some(schema(dim)), 0).unwrap();
         engine.put_kv(b"del_k", b"del_v", None).unwrap();
@@ -149,7 +150,7 @@ fn delete_ops_replayed_on_recover() {
         engine.insert_vector(8, &[8.0, 0.0], None).unwrap();
     }
 
-    // phase 2：重开 recover，删的确实删，留的确实在
+    // phase 2: reopen and recover; deleted gone, kept present
     let engine = Engine::open(&home, None, 0).unwrap();
     let del_buf = engine.get_kv_zero_copy(b"del_k", None).unwrap();
     assert!(del_buf.is_none(), "deleted kv key gone after recover");
@@ -166,21 +167,21 @@ fn delete_ops_replayed_on_recover() {
     assert_eq!(hits[0].0, 8, "kept vector id=8 recovered");
 }
 
-/// recover 后 WAL 截断：再开 plan 空
+/// WAL truncated after recover: plan empty on next open
 #[test]
 fn recover_truncates_wal_no_replay_after() {
     let dir = tempdir().unwrap();
     let home = dir.path().join("ns");
     let dim = 2usize;
 
-    // 写 3 条，crash
+    // Write 3 entries, crash
     {
         let engine = Engine::open(&home, Some(schema(dim)), 0).unwrap();
         for i in 0..3u64 {
             engine.insert_vector(i, &[i as f32, 0.0], None).unwrap();
         }
     }
-    // crash 前 WAL 有 3 条待重放
+    // Before the crash the WAL holds 3 pending entries
     let plan_before = build_recover_plan(&home.join("wal")).unwrap();
     assert_eq!(
         plan_before.entries.len(),
@@ -188,7 +189,7 @@ fn recover_truncates_wal_no_replay_after() {
         "3 entries pending before reopen"
     );
 
-    // 重开：recover 重放 + finalize_recover 截断
+    // Reopen: recover replays + finalize_recover truncates
     let _engine = Engine::open(&home, None, 0).unwrap();
     let plan_after = _engine.pending_recover_plan().unwrap();
     assert!(
@@ -197,14 +198,14 @@ fn recover_truncates_wal_no_replay_after() {
     );
 }
 
-/// seq 单调续号：crash 后重开新写紧接 max+1
+/// seq continues monotonically: after crash + reopen, new writes pick up at max+1
 #[test]
 fn crash_resume_seq_continues_monotonic() {
     let dir = tempdir().unwrap();
     let home = dir.path().join("ns");
     let dim = 2usize;
 
-    // 写 100 KV，crash
+    // Write 100 KV entries, crash
     {
         let engine = Engine::open(&home, Some(schema(dim)), 0).unwrap();
         for i in 0..100u64 {
@@ -212,13 +213,13 @@ fn crash_resume_seq_continues_monotonic() {
             engine.put_kv(&k, b"v", None).unwrap();
         }
     }
-    // crash 后重开：新写应紧接续号（recover 不回卷 seq）
+    // After crash + reopen: new writes continue the sequence (recover never rewinds seq)
     let engine = Engine::open(&home, None, 0).unwrap();
     engine.put_kv(b"new", b"v", None).unwrap();
-    // recover plan 应空（open 已截断），但新写已落 WAL next 条
+    // Recover plan should be empty (open already truncated), but the new write has landed in the WAL
     let plan = engine.pending_recover_plan().unwrap();
-    // checkpoint 后 marker applied_seq 推进；此处无 checkpoint 故 applied_seq=0，
-    // 但 open 已 finalize_recover 截断到 max_seq(100)，故新写 seq=101，plan 含 1 条
+    // After checkpoint the marker applied_seq advances; no checkpoint here so applied_seq=0,
+    // but open already finalized_recover truncated to max_seq(100), so the new write has seq=101 and the plan holds 1 entry
     assert_eq!(plan.entries.len(), 1, "only the new write seq=101 pending");
     assert_eq!(
         plan.entries[0].seq, 101,

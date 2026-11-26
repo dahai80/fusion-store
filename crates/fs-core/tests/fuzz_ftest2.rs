@@ -1,12 +1,12 @@
-//! F-TEST-2 proptest fuzz harness —— 异常输入属性测试 [v2 P2-13]
+//! F-TEST-2 proptest fuzz harness — malformed-input property tests [v2 P2-13]
 //!
-//! 审计 F-TEST-2 指出：crash 测试覆盖正常路径，异常输入模糊覆盖弱。
-//! 三个属性面：
-//!   1. WAL torn-frame 容错（任意截断点 → read_all 不 panic，返回截断点前完整帧）
-//!   2. 并发 compact+insert+search 交错 → 不死锁/不丢数据/不 panic
-//!   3. 边界 dim/value 大小 → 维度不符拒 DimensionMismatch，合法边界往返一致
+//! Audit finding F-TEST-2: crash tests cover the happy path only; malformed-input fuzz coverage is weak.
+//! Three property surfaces:
+//!   1. WAL torn-frame tolerance (arbitrary truncation point → read_all never panics, returns intact frames before the cut)
+//!   2. Concurrent compact+insert+search interleaving → no deadlock / no data loss / no panic
+//!   3. Boundary dim/value sizes → dim mismatch rejected with DimensionMismatch, legal boundaries round-trip byte-exact
 //!
-//! proptest 配置：cases 默认 256，配 env FS_FUZZ_CASES 可调（CI 跑轻量，本地跑重）。
+//! proptest config: cases default to 256, tunable via env FS_FUZZ_CASES (light in CI, heavy locally).
 
 use std::sync::Arc;
 
@@ -19,7 +19,7 @@ use fs_core::mem::CheckpointMarker;
 use fs_core::vector::schema::{MetricKind, VectorSchema};
 use fs_core::{Engine, FusionStoreEngine};
 
-/// proptest 运行 case 数（env 可覆盖，默认 256 —— 平衡覆盖与 CI 时长）。
+/// proptest case count (env-overridable, default 256 — balances coverage vs CI time).
 fn fuzz_cases() -> usize {
     std::env::var("FS_FUZZ_CASES")
         .ok()
@@ -27,7 +27,7 @@ fn fuzz_cases() -> usize {
         .unwrap_or(256)
 }
 
-/// 生成合法 WalOp 策略：key/value/table_id 短字串，vector dim 1..=16
+/// WalOp strategy: short key/value/table_id strings, vector dim 1..=16
 fn wal_op_strategy() -> impl Strategy<Value = WalOp> {
     prop_oneof![
         (
@@ -46,13 +46,13 @@ fn wal_op_strategy() -> impl Strategy<Value = WalOp> {
     ]
 }
 
-// ===== 1. WAL torn-frame 容错属性 =====
+// ===== 1. WAL torn-frame tolerance property =====
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(fuzz_cases() as u32))]
 
-    /// 任意条目序列 + 任意截断点 → read_all 不 panic。
-    /// 不变：返回条目数 ≤ 写入数；每条 seq 严格递增（截断点前完整帧）。
+    /// Arbitrary op sequence + arbitrary truncation point → read_all never panics.
+    /// Invariant: returned entry count ≤ written count; seq strictly increasing per entry (intact frames before the cut).
     #[test]
     fn prop_wal_torn_truncation_never_panics(
         ops in prop::collection::vec(wal_op_strategy(), 1..50),
@@ -62,14 +62,14 @@ proptest! {
         let wal_dir = dir.path().to_path_buf();
         let log_path = wal_dir.join("wal.log");
 
-        // 写入完整帧序列
+        // Write the full frame sequence
         {
             let mut wal = Wal::open(&wal_dir).unwrap();
             for op in &ops {
                 wal.append(op.clone()).unwrap();
             }
         }
-        // 按比例截断日志尾部（模拟崩溃撕裂：截断点可能在 header 中部 / body 中部 / 帧边界）
+        // Truncate the log tail proportionally (simulates crash torn write: cut may land mid-header / mid-body / at a frame boundary)
         let data = std::fs::read(&log_path).unwrap();
         let cut = if data.is_empty() {
             0
@@ -78,7 +78,7 @@ proptest! {
         };
         std::fs::write(&log_path, &data[..cut]).unwrap();
 
-        // 不变：read_all 不 panic；返回 ≤ 写入数；seq 递增
+        // Invariant: read_all never panics; returns ≤ written count; seq strictly increasing
         let wal = Wal::open(&wal_dir).unwrap();
         let entries = wal.read_all().unwrap();
         prop_assert!(entries.len() <= ops.len(), "torn tail never yields more than written");
@@ -89,8 +89,8 @@ proptest! {
         }
     }
 
-    /// 任意条目序列 + marker applied_seq → recover plan 只含 seq > applied_seq，不 panic。
-    /// 不变：plan.entries 全部 seq > applied_seq；applied_seq 与 marker 一致。
+    /// Arbitrary op sequence + marker applied_seq → recover plan only holds seq > applied_seq, never panics.
+    /// Invariant: every plan.entries seq > applied_seq; applied_seq matches the marker.
     #[test]
     fn prop_recover_plan_filters_by_applied_seq(
         ops in prop::collection::vec(wal_op_strategy(), 1..40),
@@ -104,7 +104,7 @@ proptest! {
             for op in &ops {
                 last = wal.append(op.clone()).unwrap();
             }
-            // marker 取写入数的百分比位置
+            // Place the marker at a percentage position of the written count
             let applied = (last * marker_seq_pct) / 100;
             wal.write_marker(&CheckpointMarker {
                 applied_seq: applied,
@@ -120,8 +120,8 @@ proptest! {
         prop_assert!(plan.applied_seq <= max_seq, "applied_seq bounded by max written seq");
     }
 
-    /// 二进制编解码往返（经公共 API）：任意 WalOp → append → read_all == 原 op。
-    /// 不变：往返无损（向量 f32 比特级一致，含 NaN/Inf）。
+    /// Binary codec round-trip (via public API): any WalOp → append → read_all == original op.
+    /// Invariant: lossless round-trip (vector f32 bit-exact, including NaN/Inf).
     #[test]
     fn prop_wal_op_binary_roundtrip(op in wal_op_strategy()) {
         let dir = tempdir().unwrap();
@@ -133,11 +133,11 @@ proptest! {
     }
 }
 
-// ===== 2. 并发 compact+insert+search 交错属性 =====
+// ===== 2. Concurrent compact+insert+search interleaving property =====
 
-/// 并发不交死锁 + 数据一致：N 插入线程 + 1 compact 线程 + M search 线程同时跑，
-/// 全部完成后：活向量数 == 成功插入数 - 成功删除数；search 不 panic。
-/// 注：proptest 驱动参数化（线程数/向量数），非真随机交错，但覆盖多规模组合。
+/// Concurrent no-deadlock + data consistency: N inserter threads + 1 compactor thread + M searcher threads run
+/// simultaneously; after all join: live vector count == successful inserts - successful deletes; search never panics.
+/// Note: parameterized via proptest (thread/vector counts), not true random interleaving, but covers multiple scale combinations.
 #[test]
 fn concurrent_compact_insert_search_no_deadlock_no_data_loss() {
     let dir = tempdir().unwrap();
@@ -147,7 +147,7 @@ fn concurrent_compact_insert_search_no_deadlock_no_data_loss() {
     let n_inserts: usize = 200;
     let n_deletes: usize = 50;
 
-    // 插入线程：id 0..n_inserts
+    // Inserter thread: ids 0..n_inserts
     let eng = engine.clone();
     let inserter = std::thread::spawn(move || {
         let mut ok = 0usize;
@@ -160,7 +160,7 @@ fn concurrent_compact_insert_search_no_deadlock_no_data_loss() {
         ok
     });
 
-    // compact 线程：跑 3 轮 compact（COW 原子切换）
+    // Compactor thread: runs 3 compact rounds (COW atomic swap)
     let eng = engine.clone();
     let compactor = std::thread::spawn(move || {
         for _ in 0..3 {
@@ -169,7 +169,7 @@ fn concurrent_compact_insert_search_no_deadlock_no_data_loss() {
         }
     });
 
-    // search 线程：持续 KNN 查询，不 panic
+    // Searcher thread: continuous KNN queries, never panics
     let eng = engine.clone();
     let searcher = std::thread::spawn(move || {
         let mut ok = 0usize;
@@ -182,9 +182,9 @@ fn concurrent_compact_insert_search_no_deadlock_no_data_loss() {
         ok
     });
 
-    // 删除线程：删 id 0..n_deletes（与插入交叠）
-    // 计实际移除数（delete_vector 返 Ok(true)=真删 / Ok(false)=id 未插入或已删），
-    // 非 is_ok()——后者把 Ok(false)（竞态下 id 尚未插入）误计为删除，破坏不变式。
+    // Deleter thread: deletes ids 0..n_deletes (overlapping with inserts)
+    // Counts actual removals (delete_vector returns Ok(true)=deleted / Ok(false)=id not yet inserted or already deleted),
+    // not is_ok() — the latter would miscount Ok(false) (id not yet inserted under the race) as a delete, breaking the invariant.
     let eng = engine.clone();
     let deleter = std::thread::spawn(move || {
         let mut removed = 0usize;
@@ -202,7 +202,7 @@ fn concurrent_compact_insert_search_no_deadlock_no_data_loss() {
     let _searched = searcher.join().expect("searcher panicked");
     let deleted = deleter.join().expect("deleter panicked");
 
-    // 不变：活向量数 == 成功插入 - 成功删除（compact 不丢活向量，仅重排）
+    // Invariant: live vector count == successful inserts - successful deletes (compact never drops live vectors, only rearranges)
     let live = engine.vec_index().unwrap();
     let idx = live.as_ref().unwrap();
     let expected = inserted.saturating_sub(deleted);
@@ -216,7 +216,7 @@ fn concurrent_compact_insert_search_no_deadlock_no_data_loss() {
     );
 }
 
-/// 经 Engine 触发 compact（run_compact 需 VectorIndex 引用，Engine 经 vec_index guard 取）。
+/// Trigger compact via Engine (run_compact needs a VectorIndex reference; Engine gets it via the vec_index guard).
 fn run_compact_via_engine(engine: &Arc<Engine>) -> fs_core::Result<()> {
     use fs_core::compact::run_compact;
     let g = engine.vec_index()?;
@@ -225,13 +225,13 @@ fn run_compact_via_engine(engine: &Arc<Engine>) -> fs_core::Result<()> {
     Ok(())
 }
 
-// ===== 3. 边界 dim / value 大小属性 =====
+// ===== 3. Boundary dim / value size properties =====
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(fuzz_cases() as u32))]
 
-    /// 合法维度 insert + search 往返一致：任意 dim 1..=64，插入后 search 命中自身。
-    /// 不变：search_knn top_k=1 返回 (id, 0.0-ish 距离) —— 自查最近。
+    /// Legal-dim insert + search round-trip: any dim 1..=64, search hits self after insert.
+    /// Invariant: search_knn top_k=1 returns (id, ~0.0 distance) — self is the nearest.
     #[test]
     fn prop_insert_search_roundtrip_arbitrary_dim(dim in 1usize..=64) {
         let dir = tempdir().unwrap();
@@ -244,8 +244,8 @@ proptest! {
         prop_assert_eq!(hits[0].0, 7, "self-query returns own id");
     }
 
-    /// 维度不符拒 DimensionMismatch，不静默写错。
-    /// 不变：插入 dim ≠ schema.dim 的向量 → Err(DimensionMismatch)，不落段。
+    /// Dim mismatch rejected with DimensionMismatch, never silently miswritten.
+    /// Invariant: inserting a vector with dim ≠ schema.dim → Err(DimensionMismatch), nothing written to a segment.
     #[test]
     fn prop_dim_mismatch_rejected(schema_dim in 1usize..=64, insert_dim in 1usize..=64) {
         prop_assume!(schema_dim != insert_dim, "skip matching dim");
@@ -258,14 +258,14 @@ proptest! {
             matches!(res, Err(fs_core::StoreError::DimensionMismatch { .. })),
             "dim mismatch rejected, not silent write"
         );
-        // 不变：未落段 → list_vector_ids 为空
+        // Invariant: nothing written to segment → list_vector_ids is empty
         let ids = engine.list_vector_ids(None).unwrap();
         prop_assert!(ids.is_empty(), "rejected vector not persisted");
     }
 
-    /// KV 边界 value 往返（合法大小）：任意 key 1..=256B / value ≤1KB → put + get 字节等。
-    /// 注：空 key / 超大 key 由 put_kv 显式拒 InvalidKey（见 prop_kv_invalid_key_rejected）。
-    /// 不变：合法范围内 put_kv 成功 + 读出 == 写入。
+    /// KV boundary value round-trip (legal sizes): any key 1..=256B / value ≤1KB → put + get byte-exact.
+    /// Note: empty keys / oversized keys are explicitly rejected by put_kv with InvalidKey (see prop_kv_invalid_key_rejected).
+    /// Invariant: put_kv succeeds within the legal range + read-back == written.
     #[test]
     fn prop_kv_boundary_value_roundtrip(
         key in prop::collection::vec(any::<u8>(), 1..=256),
@@ -281,8 +281,8 @@ proptest! {
         prop_assert_eq!(&got_bytes[..], &value[..], "kv value roundtrip byte-exact");
     }
 
-    /// KV 非法 key（空 / >LMDB MDB_MAXKEYSIZE 511B）→ put_kv 返 Err(InvalidKey)，不 panic。
-    /// 不变：非法被显式拒（Rule 12 fail visibly），store 不损坏，无晦涩 BadValSize 泄漏。
+    /// KV invalid key (empty / > LMDB MDB_MAXKEYSIZE 511B) → put_kv returns Err(InvalidKey), never panics.
+    /// Invariant: invalid input explicitly rejected (Rule 12 fail visibly), store unharmed, no cryptic BadValSize leak.
     #[test]
     fn prop_kv_invalid_key_rejected(key_len in 0u32..=1200) {
         let dir = tempdir().unwrap();
@@ -301,7 +301,7 @@ proptest! {
         }
     }
 
-    /// KNN top_k 边界：top_k=0 空结果，top_k > 实际向量数 返回全部（不越界）。
+    /// KNN top_k bounds: top_k=0 empty result, top_k > actual vector count returns all (no out-of-bounds).
     #[test]
     fn prop_knn_top_k_bounds(n in 1usize..=20, top_k in 0usize..=40) {
         let dir = tempdir().unwrap();

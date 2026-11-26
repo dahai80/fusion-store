@@ -1,15 +1,15 @@
-//! fs-cli —— fusion-store 管理命令 [v2 M4d]
+//! fs-cli — fusion-store management CLI [v2 M4d]
 //!
-//! 子命令（PRD-plan §2.9）：
-//!   - init   初始化 namespace 目录（登记 VectorSchema dim/metric）
-//!   - put    写 KV
-//!   - get    读 KV（零拷贝读后打印）
-//!   - stats  段/向量数/配额用量统计
-//!   - compact 物理清理软删向量 + 重建图 snapshot（COW 原子切换 A3）
-//!   - recover 手动触发崩溃恢复（幂等 §2.7）
-//!   - serve  启管理 daemon（11463 R3，委托 fs-serve）
+//! Subcommands (PRD-plan §2.9):
+//!   - init    initialize namespace dir (register VectorSchema dim/metric)
+//!   - put     write KV
+//!   - get     read KV (zero-copy read, then print)
+//!   - stats   segment/vector count/quota usage stats
+//!   - compact physically purge soft-deleted vectors + rebuild graph snapshot (COW atomic swap A3)
+//!   - recover manually trigger crash recovery (idempotent §2.7)
+//!   - serve   start management daemon (port 11463 R3, delegates to fs-serve)
 //!
-//! 日志走 stderr，stdout 仅输出结果（供脚本/测试解析）。
+//! Logs go to stderr; stdout carries only results (parsed by scripts/tests).
 
 use std::path::{Path, PathBuf};
 
@@ -21,9 +21,9 @@ use fs_core::vector::schema::{MetricKind, VectorSchema};
 use fs_core::{Engine, FusionStoreEngine};
 
 #[derive(Parser)]
-#[command(name = "fusion-store", version, about = "fusion-store 管理命令")]
+#[command(name = "fusion-store", version, about = "fusion-store management CLI")]
 struct Cli {
-    /// 数据根目录（默认 ~/.fusion-store）
+    /// Data root directory (default ~/.fusion-store)
     #[arg(long, env = "FS_HOME", global = true)]
     home: Option<PathBuf>,
     #[command(subcommand)]
@@ -32,21 +32,21 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// 初始化 namespace 目录（登记 VectorSchema）
+    /// Initialize namespace directory (register VectorSchema)
     Init {
         #[arg(long, default_value = "default")]
         namespace: String,
-        /// 段容量（字节，0=默认 64MB）
+        /// Segment capacity (bytes, 0 = default 64MB)
         #[arg(long, default_value_t = 0)]
         seg_size: u64,
-        /// namespace 配额上限（字节，0=不限）
+        /// Namespace quota limit (bytes, 0 = unlimited)
         #[arg(long, default_value_t = 0)]
         quota: u64,
-        /// 向量维度（建库用，已存在则忽略）
+        /// Vector dimension (used on create; ignored if store already exists)
         #[arg(long, default_value_t = 768)]
         dim: usize,
     },
-    /// 写 KV
+    /// Write KV
     Put {
         #[arg(long, default_value = "default")]
         namespace: String,
@@ -57,7 +57,7 @@ enum Cmd {
         #[arg(long, default_value_t = 0)]
         quota: u64,
     },
-    /// 读 KV（输出 value，零拷贝读后打印）
+    /// Read KV (prints the value; zero-copy read)
     Get {
         #[arg(long, default_value = "default")]
         namespace: String,
@@ -65,46 +65,47 @@ enum Cmd {
         #[arg(long, default_value_t = 0)]
         seg_size: u64,
     },
-    /// 段/向量数/配额用量统计
+    /// Segment/vector count/quota usage stats
     Stats {
         #[arg(long, default_value = "default")]
         namespace: String,
         #[arg(long, default_value_t = 0)]
         seg_size: u64,
     },
-    /// 物理清理软删向量 + 重建 NSW 图 snapshot（COW 原子切换）
+    /// Physically purge soft-deleted vectors + rebuild NSW graph snapshot (COW atomic swap)
     Compact {
         #[arg(long, default_value = "default")]
         namespace: String,
         #[arg(long, default_value_t = 0)]
         seg_size: u64,
-        /// compact 后立即回收旧段（默认等待安全期，此处 CLI 直接回收）
+        /// Reclaim old segments immediately after compact (default waits out the safety period; CLI reclaims directly)
         #[arg(long, default_value_t = false)]
         reclaim_now: bool,
     },
-    /// 手动触发崩溃恢复（幂等，读 WAL + 报告待重放条目 + 截断）
+    /// Manually trigger crash recovery (idempotent: read WAL + report pending entries + truncate)
     Recover {
         #[arg(long, default_value = "default")]
         namespace: String,
-        /// 仅报告不执行截断
+        /// Report only, do not truncate
         #[arg(long, default_value_t = false)]
         dry_run: bool,
     },
-    /// 启管理 daemon（端口 11463，委托 fs-serve）
+    /// Start management daemon (port 11463, delegates to fs-serve)
     Serve {
         #[arg(long, default_value = "default")]
         namespace: String,
-        /// 监听端口（默认 11463 R3）
+        /// Listen port (default 11463 R3)
         #[arg(long, env = "FUSION_STORE_PORT", default_value_t = fs_serve::DEFAULT_PORT)]
         port: u16,
-        /// 监听地址（F-SEC-1，默认 127.0.0.1 环回；FS_BIND 环境变量可覆盖）。
-        /// 容器化/网络部署设 0.0.0.0，务必同时配 FS_AUTH_TOKEN + 网络层 ACL。
+        /// Bind address (F-SEC-1, default 127.0.0.1 loopback; FS_BIND env can override).
+        /// For containerized/network deployments set 0.0.0.0, and always pair it with
+        /// FS_AUTH_TOKEN plus network-level ACLs.
         #[arg(long, env = "FS_BIND", default_value = "127.0.0.1")]
         bind: String,
-        /// 向量维度（建库用，已存在则忽略）
+        /// Vector dimension (used on create; ignored if store already exists)
         #[arg(long, default_value_t = 768)]
         dim: usize,
-        /// 写队列上限（0=默认 10K）
+        /// Write queue capacity (0 = default 10K)
         #[arg(long, default_value_t = 0)]
         queue_cap: usize,
         #[arg(long, default_value_t = 0)]
@@ -116,7 +117,7 @@ enum Cmd {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // 日志走 stderr，stdout 仅输出结果（供脚本/测试解析）
+    // Logs go to stderr; stdout carries only results (parsed by scripts/tests)
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .init();
@@ -170,7 +171,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-// ---- 子命令实现（占位，下方 Edit 填充） ----
+// ---- subcommand implementations ----
 
 fn cmd_init(home: &Path, ns: &str, _seg_size: u64, quota: u64, dim: usize) -> Result<()> {
     let dir = home.join(ns);
@@ -257,7 +258,8 @@ fn cmd_compact(home: &Path, ns: &str, _seg_size: u64, reclaim_now: bool) -> Resu
         let g = engine.vec_index()?;
         let idx = g.as_ref().unwrap();
         let n = fs_core::compact::reclaim(idx, &res.reclaimable_segs)?;
-        // E7：reclaim 内部按安全期校验，可能跳过未达下限的段——报实际回收数
+        // E7: reclaim validates against the safety period internally and may skip segments
+        // below the minimum age — report the actual reclaimed count
         if n < res.reclaimable_segs.len() {
             println!(
                 "reclaimed {} of {} old segment(s); {} skipped (sealed < safety period, retry later)",
@@ -280,7 +282,7 @@ fn cmd_recover(home: &Path, ns: &str, dry_run: bool) -> Result<()> {
     let dir = home.join(ns);
     let wal_dir = dir.join("wal");
     if dry_run {
-        // dry_run 仅读 plan 报告，不 apply 不截断
+        // dry_run only builds and reports the plan; nothing applied, nothing truncated
         let plan = build_recover_plan(&wal_dir)
             .with_context(|| format!("build recover plan namespace {}", ns))?;
         println!(
@@ -294,11 +296,11 @@ fn cmd_recover(home: &Path, ns: &str, dry_run: bool) -> Result<()> {
         println!("dry_run: WAL not applied, not truncated");
         return Ok(());
     }
-    // 非 dry_run：Engine::open 内嵌自动 recover（A2：recover 是 open 副作用，非独立动作）
+    // Not dry_run: Engine::open embeds auto recover (A2: recover is an open side effect, not a standalone action)
     let _engine = Engine::open(&dir, None, 0)
         .with_context(|| format!("engine open + auto-recover namespace {}", ns))?;
-    // 重放后 WAL 已截断到 max_seq（finalize_recover 在 open 内调）
-    // A1：Engine 持 Wal 排他 flock，不可再 build_recover_plan 重开 → 用 Engine 内省
+    // After replay the WAL is truncated to max_seq (finalize_recover runs inside open)
+    // A1: Engine holds the WAL's exclusive flock, so build_recover_plan cannot reopen it — use Engine introspection
     let plan_after = _engine.pending_recover_plan()?;
     if plan_after.entries.is_empty() {
         println!("recover ok: WAL replayed + truncated, nothing pending");
@@ -311,7 +313,8 @@ fn cmd_recover(home: &Path, ns: &str, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
-// F-SEC-1：参数从 clap Serve 子命令透传，数量由 CLI flag 决定，非设计冗余。
+// F-SEC-1: parameters are passed through from the clap Serve subcommand; the count is
+// driven by CLI flags, not design redundancy.
 #[allow(clippy::too_many_arguments)]
 async fn cmd_serve(
     home: &Path,
@@ -350,11 +353,12 @@ async fn cmd_serve(
         rx,
         fs_serve::WRITE_WORKERS,
     );
-    // R10/F-SEC-2/F-SEC-3：CLI serve 共享 fs-serve 的 token→role 载入逻辑（env + 文件）。
-    // CLI 本地工具常匿名放行；若 FS_AUTH_TOKEN* 已设则按角色门禁（与 daemon 一致）。
+    // R10/F-SEC-2/F-SEC-3: CLI serve shares fs-serve's token->role loading logic (env + file).
+    // The CLI is often anonymous by default; if FS_AUTH_TOKEN* is set, role gating applies (same as the daemon).
     let auth = fs_serve::build_auth_from_env().with_context(|| "load auth tokens from env/file")?;
     let auth_enabled = !auth.is_empty();
-    // F-SEC-1：监听地址经 --bind/FS_BIND 配置。先解析定 bind_is_loopback（F-OPS-8 /stats 守门用）。
+    // F-SEC-1: bind address comes from --bind/FS_BIND. Parse first to fix bind_is_loopback
+    // (used by the F-OPS-8 /stats gate).
     let ip: std::net::IpAddr = bind
         .parse()
         .with_context(|| format!("invalid --bind/FS_BIND address: {}", bind))?;
@@ -363,8 +367,8 @@ async fn cmd_serve(
         tracing::warn!("FS_AUTH_TOKEN not set: admin/write endpoints anonymous (loopback only)");
     }
     if !bind_is_loopback && !auth_enabled {
-        // F-SEC-1 / Rule 12 fail visibly：非环回 + 无 token = 拒绝启动（hard fail）。
-        // 与 fs-serve daemon 一致。容器 --bind 0.0.0.0 场景必踩。
+        // F-SEC-1 / Rule 12 fail visibly: non-loopback + no token = refuse to start (hard fail).
+        // Consistent with the fs-serve daemon. Always hit in container --bind 0.0.0.0 scenarios.
         fs_serve::enforce_bind_auth_policy(&bind, bind_is_loopback, auth_enabled)
             .with_context(|| "bind/auth policy")?;
     }
@@ -386,7 +390,7 @@ async fn cmd_serve(
     Ok(())
 }
 
-/// 默认 home：~/.fusion-store
+/// Default home: ~/.fusion-store
 fn dirs_or_default() -> PathBuf {
     if let Some(h) = std::env::var_os("HOME") {
         PathBuf::from(h).join(".fusion-store")

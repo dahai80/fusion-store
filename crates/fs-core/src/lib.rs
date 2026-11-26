@@ -1,8 +1,8 @@
-//! fusion-store 核心引擎库 —— 单机零拷贝存储与索引底座
+//! fusion-store core engine library — single-node zero-copy storage and indexing base
 //!
-//! 公共表面：[`ZeroCopyBuffer`] / [`MmapHandle`] / [`VectorSchema`] /
-//! [`FusionStoreEngine`] trait / [`StoreError`]。
-//! 详细架构见 `~/fusion/fusion-store-prd-plan-0826.md` v2.0。
+//! Public surface: [`ZeroCopyBuffer`] / [`MmapHandle`] / [`VectorSchema`] /
+//! the [`FusionStoreEngine`] trait / [`StoreError`].
+//! See `~/fusion/fusion-store-prd-plan-0826.md` v2.0 for the detailed architecture.
 
 pub mod columnar;
 pub mod compact;
@@ -14,9 +14,10 @@ pub mod sharded;
 pub mod store;
 pub mod vector;
 
-/// heed EnvOpenOptions 的 max_dbs 共享常量（F-PERF-8）。
-/// KV / Vector / Columnar 三 store 各开独立 heed env，max_dbs 上限统一为 8，
-/// 提名为常量防三处魔数漂移（任一处改小 → create_database 漏库 panic）。
+/// Shared constant for heed EnvOpenOptions max_dbs (F-PERF-8).
+/// KV / Vector / Columnar each open their own heed env with max_dbs capped at 8;
+/// named as a constant to prevent magic-number drift across the three sites
+/// (lowering any one below the actual db count makes create_database panic).
 pub const HEED_MAX_DBS: u32 = 8;
 
 pub use compact::{reclaim, run_compact, CompactResult};
