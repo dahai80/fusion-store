@@ -5,7 +5,7 @@ use fs_core::vector::store::VectorIndex;
 use tempfile::tempdir;
 
 fn main() {
-    // 每个 N 用全新 idx（避免 id 冲突），测图构建随规模变化的吞吐
+    // Fresh idx per N (avoids id collisions), measuring graph-build throughput vs scale
     for &n in &[100usize, 500, 1000, 2000, 5000] {
         let dir = tempdir().unwrap();
         let schema = VectorSchema::new(768, MetricKind::L2);

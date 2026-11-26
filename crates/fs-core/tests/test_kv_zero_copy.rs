@@ -1,8 +1,8 @@
-//! KV 零拷贝集成测试 —— 对齐 PRD M1 验收
+//! KV zero-copy integration tests — aligned with PRD M1 acceptance
 //!
-//! 覆盖：大 value 走 payload 段、零拷贝指针落 mmap 区域、
-//! namespace 配额隔离、多进程并发读（fs-cli subprocess）。
-//! M1 规模验收用 10 万 KV（1M 留 bench，CI 不跑全量）。
+//! Covers: large values routed through the payload segment, zero-copy pointers landing in the mmap region,
+//! namespace quota isolation, multi-process concurrent reads (fs-cli subprocess).
+//! M1 scale acceptance uses 100K KV (1M left to bench; CI does not run the full scale).
 
 use std::path::Path;
 use std::process::Command;
@@ -19,7 +19,7 @@ fn large_value_rounds_through_payload_segment() {
     let dir = tempdir().unwrap();
     let store = open(dir.path(), 0);
     let key = b"large-key";
-    // 8KB payload，超 heed inline 阈值，必走 mmap 段
+    // 8KB payload exceeds the heed inline threshold, must go through the mmap segment
     let val = vec![0x7Fu8; 8 * 1024];
     store.put_kv(key, &val, None).unwrap();
     let buf = store.get_kv_zero_copy(key, None).unwrap().unwrap();
@@ -34,7 +34,7 @@ fn zero_copy_pointer_falls_in_mmap_region() {
     let key = b"zk-ptr";
     let val = b"zero-copy-pointer-assertion-payload";
     store.put_kv(key, val, None).unwrap();
-    // 填充触发封存轮转，使目标 payload 进入封存段
+    // Fill to trigger sealed-segment rotation so the target payload lands in a sealed segment
     for i in 0..40 {
         store
             .put_kv(format!("fill-{i}").as_bytes(), &[0u8; 64], None)
@@ -42,8 +42,8 @@ fn zero_copy_pointer_falls_in_mmap_region() {
     }
     let buf = store.get_kv_zero_copy(key, None).unwrap().unwrap();
     assert_eq!(buf.as_bytes(), val);
-    // 零拷贝核心断言：指针有效（段不可变保生命周期），数据正确
-    // 指针落 mmap 区域由 ZeroCopyBuffer::new 构造保证（offset 源自段基址）
+    // Zero-copy core assertions: pointer valid (segment immutability guarantees lifetime), data correct
+    // Pointer landing in the mmap region is guaranteed by ZeroCopyBuffer::new construction (offset derives from the segment base)
 }
 
 #[test]
@@ -59,17 +59,17 @@ fn overwrite_value_returns_latest() {
 
 #[test]
 fn namespace_quota_isolation() {
-    // 同进程开两 namespace，配额独立，不互扰
+    // Two namespaces in one process, independent quotas, no interference
     let root = tempdir().unwrap();
     let ns_a = root.path().join("ns-a");
     let ns_b = root.path().join("ns-b");
     let store_a = open(&ns_a, 64);
     let store_b = open(&ns_b, 1024);
-    // ns-a 配额 64，写满报错；ns-b 不受影响
+    // ns-a quota 64, write fails once full; ns-b unaffected
     store_a.put_kv(b"a1", &[0u8; 64], None).unwrap();
     let err = store_a.put_kv(b"a2", &[0u8; 8], None).unwrap_err();
     assert!(matches!(err, StoreError::QuotaExceeded));
-    // ns-b 正常写
+    // ns-b writes normally
     store_b.put_kv(b"b1", &[0u8; 256], None).unwrap();
     let buf = store_b.get_kv_zero_copy(b"b1", None).unwrap().unwrap();
     assert_eq!(buf.len(), 256);
@@ -77,10 +77,10 @@ fn namespace_quota_isolation() {
 
 #[test]
 fn scale_write_then_verify() {
-    // M1 规模验收（CI 友好档）：1 万 KV 写 + 抽检零拷贝读。
-    // 全量 100 万留 criterion bench（#[ignore]，手动跑）。
-    // 写吞吐 SLA（≥5K ops/s，H5）依赖 M4 WAL 单同步点；M1 每写 fsync，
-    // 实测吞吐在 bench 标注，SLA 达成验收移至 M4。
+    // M1 scale acceptance (CI-friendly tier): 10K KV writes + spot-check zero-copy reads.
+    // Full 1M left to a criterion bench (#[ignore], run manually).
+    // Write throughput SLA (≥5K ops/s, H5) depends on the M4 WAL single sync point; M1 fsyncs per write,
+    // measured throughput noted in the bench; SLA acceptance deferred to M4.
     let dir = tempdir().unwrap();
     let store = open(dir.path(), 0);
     let n = 10_000usize;
@@ -97,7 +97,7 @@ fn scale_write_then_verify() {
         elapsed,
         n as f64 / elapsed.as_secs_f64()
     );
-    // 抽检头尾 + 中间
+    // Spot-check head, tail + middle
     for i in [0usize, n / 2, n - 1, 42, 999] {
         let key = format!("k{i:06}").into_bytes();
         let expect = format!("v{i}").into_bytes();
@@ -109,16 +109,16 @@ fn scale_write_then_verify() {
 
 #[test]
 fn multi_process_read_via_fs_cli() {
-    // 多进程并发读验收：fs-cli 子进程读，模拟跨进程 reader
-    // F1：写入经 Engine（WAL+kv/ 子目录布局），子进程 fs-cli 经同一 Engine 路径读
+    // Multi-process concurrent read acceptance: fs-cli subprocess reads, simulating a cross-process reader
+    // F1: writes go through Engine (WAL + kv/ subdir layout), the fs-cli subprocess reads via the same Engine path
     let root = tempdir().unwrap();
     let ns = root.path().join("mp");
-    // 用主进程经 Engine 写（落地 kv/ 子目录 + WAL）
+    // Main process writes via Engine (lands kv/ subdir + WAL)
     {
         let engine = Engine::open_kv_only(&ns, 0).unwrap();
         engine.put_kv(b"mp-key", b"mp-value", None).unwrap();
     }
-    // 子进程读（fs-cli get）—— 真实第二进程
+    // Subprocess read (fs-cli get) — a real second process
     let bin = fs_cli_bin();
     let out = Command::new(&bin)
         .arg("--home")
@@ -138,7 +138,7 @@ fn multi_process_read_via_fs_cli() {
     assert_eq!(stdout.trim(), "mp-value");
 }
 
-/// 定位 fs-cli 二进制：target/{debug,release}/fs-cli
+/// Locate the fs-cli binary: target/{debug,release}/fs-cli
 fn fs_cli_bin() -> std::path::PathBuf {
     let candidates = [env!("CARGO_MANIFEST_DIR"), ".", ".."];
     for c in candidates {
@@ -152,7 +152,7 @@ fn fs_cli_bin() -> std::path::PathBuf {
             if p.exists() {
                 return p;
             }
-            // 也试相对 target
+            // Also try a relative target
             let p2 = std::path::PathBuf::from(c)
                 .join("target")
                 .join(profile)
@@ -162,6 +162,6 @@ fn fs_cli_bin() -> std::path::PathBuf {
             }
         }
     }
-    // fallback：假设 cargo test 已构建，用 cargo run
+    // fallback: assume cargo test already built it, use cargo run
     std::path::PathBuf::from("fs-cli")
 }

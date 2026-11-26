@@ -1,4 +1,4 @@
-//! L-API 引擎 trait —— 对外契约，对齐 PRD §1.4
+//! L-API engine trait — external contract, aligned with PRD §1.4
 
 use std::time::Duration;
 
@@ -9,7 +9,7 @@ use crate::vector::schema::VectorSchema;
 #[cfg(feature = "columnar")]
 use arrow::record_batch::RecordBatch as ArrowRecordBatch;
 
-/// 列式零拷贝 Batch —— 持 Arc<MmapHandle> 保活，段不可变保指针有效 [v2 H4]
+/// Columnar zero-copy batch — holds Arc<MmapHandle> for keepalive; immutable segments keep pointers valid [v2 H4]
 #[cfg(feature = "columnar")]
 pub struct ZeroCopyArrowBatch {
     pub batch: ArrowRecordBatch,
@@ -29,11 +29,12 @@ impl ZeroCopyArrowBatch {
     }
 }
 
-/// 引擎公共表面 —— fusion-store 对外契约
+/// Engine public surface — the fusion-store external contract
 ///
-/// timeout 参数：避免 Agent 编排在慢操作下阻塞 [v2 A1]，None 表示无超时。
+/// timeout parameter: prevents Agent orchestration from blocking on slow operations
+/// [v2 A1]; None means no timeout.
 pub trait FusionStoreEngine {
-    // —— KV 原语 ——
+    // —— KV primitives ——
     fn put_kv(&self, key: &[u8], value: &[u8], timeout: Option<Duration>) -> Result<()>;
     fn get_kv_zero_copy(
         &self,
@@ -42,14 +43,14 @@ pub trait FusionStoreEngine {
     ) -> Result<Option<ZeroCopyBuffer>>;
     fn delete_kv(&self, key: &[u8], timeout: Option<Duration>) -> Result<bool>;
 
-    // —— 向量库生命周期（schema 建库时锁定）——
+    // —— Vector index lifecycle (schema locked at creation) ——
     fn create_vector_index(&self, name: &str, schema: VectorSchema) -> Result<()>;
     fn open_vector_index(&self, name: &str) -> Result<VectorSchema>;
 
-    // —— 向量原语 ——
-    // 维度不符 schema.dim → DimensionMismatch，不静默 [v2 E2]
+    // —— Vector primitives ——
+    // Dimension not matching schema.dim returns DimensionMismatch, never silent [v2 E2]
     fn insert_vector(&self, id: u64, vector: &[f32], timeout: Option<Duration>) -> Result<()>;
-    // 批量插入：多 Agent 攒批后单次提交，减少 flock 竞争 [v2 R1/R5]
+    // Batch insert: multiple Agents accumulate then commit once, reducing flock contention [v2 R1/R5]
     fn insert_vector_batch(&self, items: &[(u64, &[f32])], timeout: Option<Duration>)
         -> Result<()>;
     fn search_knn(
@@ -60,12 +61,12 @@ pub trait FusionStoreEngine {
     ) -> Result<Vec<(u64, f32)>>;
     fn delete_vector(&self, id: u64, timeout: Option<Duration>) -> Result<bool>;
 
-    // —— 向量读取/枚举（消费方 retrieve_context 兜底 + reconcile 审计，#3）——
-    // id 不存在或已软删 → None；list 排除软删
+    // —— Vector read/enumeration (consumer retrieve_context fallback + reconcile audit, #3) ——
+    // Missing id or soft-deleted returns None; list excludes soft-deleted
     fn get_vector(&self, id: u64, timeout: Option<Duration>) -> Result<Option<Vec<f32>>>;
     fn list_vector_ids(&self, timeout: Option<Duration>) -> Result<Vec<u64>>;
 
-    // —— 列式原语（通用 Arrow，不涉 MLX）[v2 H3] ——
+    // —— Columnar primitives (generic Arrow, no MLX involvement) [v2 H3] ——
     #[cfg(feature = "columnar")]
     fn put_columnar(
         &self,
@@ -81,9 +82,10 @@ pub trait FusionStoreEngine {
         timeout: Option<Duration>,
     ) -> Result<Option<ZeroCopyArrowBatch>>;
 
-    // —— 生命周期 ——
+    // —— Lifecycle ——
     fn checkpoint(&self) -> Result<()>;
     fn recover(&self) -> Result<()>;
-    // A6：有序关闭——flush active 段 + heed sync + WAL 最终 marker，免正常退出丢数据
+    // A6: orderly shutdown — flush active segments + heed sync + final WAL marker,
+    // so a normal exit never loses data
     fn close(&self) -> Result<()>;
 }

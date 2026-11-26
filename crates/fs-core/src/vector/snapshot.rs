@@ -1,17 +1,19 @@
-//! 图 snapshot —— CSR 序列化落单 mmap 段 + 重启重载 [v2 H1]
+//! Graph snapshot — CSR serialization into a single mmap segment + reload on restart [v2 H1]
 //!
-//! NSW 图常驻 RAM，定期 snapshot 拓扑到单 mmap 段文件（graph_snapshot.mmap）。
-//! 重启时从 snapshot 段重载图拓扑到 RAM，无需重建（H1 持久化对策）。
+//! The NSW graph is resident in RAM; its topology is periodically snapshotted
+//! into a single mmap segment file (graph_snapshot.mmap). On restart the graph
+//! topology is reloaded from the snapshot segment into RAM without a rebuild
+//! (H1 persistence measure).
 //!
-//! CSR 格式（紧凑、顺序访问友好）：
+//! CSR format (compact, sequential-access friendly):
 //! ```text
 //! [magic u32][node_count u32][edge_count u32][entry_point u64][crc u32]
 //! [node_ids: u64 * node_count]
-//! [offsets:  u32 * (node_count+1)]   // 每节点邻居在 edges 区的起止
-//! [edges:    u64 * edge_count]       // 邻居 id 扁平
-//! [deleted_flags: u8 * node_count]   // 软删标记位
+//! [offsets:  u32 * (node_count+1)]   // start/end of each node's neighbors in the edges region
+//! [edges:    u64 * edge_count]       // flattened neighbor ids
+//! [deleted_flags: u8 * node_count]   // soft-delete flag bits
 //! ```
-//! 重载时按 node_ids/offsets/edges 重建 NswGraph.nodes。
+//! On reload, NswGraph.nodes is rebuilt from node_ids/offsets/edges.
 
 use std::fs::{File, OpenOptions};
 use std::path::Path;
@@ -25,7 +27,7 @@ const MAGIC: u32 = 0xF5_C5_04; // fs-core graph snapshot
 const SNAPSHOT_FILE: &str = "graph_snapshot.mmap";
 const SNAPSHOT_TMP: &str = "graph_snapshot.mmap.tmp";
 
-// CRC-32 IEEE（table-less）—— snapshot 完整性校验，拒截断/伪造/半写
+// CRC-32 IEEE (table-less) — snapshot integrity check, rejects truncation/forgery/half-writes
 fn crc32_update(mut crc: u32, data: &[u8]) -> u32 {
     for &b in data {
         crc ^= b as u32;
@@ -44,15 +46,15 @@ fn crc32_finalize(crc: u32) -> u32 {
     !crc
 }
 
-/// 序列化图为 CSR 字节流
+/// Serialize the graph into a CSR byte stream
 pub fn serialize(graph: &NswGraph) -> Vec<u8> {
-    // L7：含 deleted 标记，持久化软删状态（重启后不复活已删节点）
+    // L7: include deleted flags so soft-delete state survives restart (deleted nodes are not revived)
     let nodes = graph.snapshot_nodes_with_deleted();
     let node_count = nodes.len() as u32;
     let edge_count: u32 = nodes.iter().map(|(_, nb, _)| nb.len() as u32).sum();
     let entry_point = graph.snapshot_entry_point().unwrap_or(0);
 
-    // 头 4*4 + 8(entry) + 4(crc) = 28 字节
+    // Header 4*4 + 8(entry) + 4(crc) = 28 bytes
     let header = 28usize;
     let ids_off = header;
     let ids_len = node_count as usize * 8;
@@ -77,7 +79,8 @@ pub fn serialize(graph: &NswGraph) -> Vec<u8> {
     let mut acc: u32 = 0;
     buf[off_cursor..off_cursor + 4].copy_from_slice(&acc.to_le_bytes());
     off_cursor += 4;
-    // L7：逐节点写 deleted flag（1=软删），重启 load 读回，不复活已删节点
+    // L7: write the deleted flag per node (1 = soft-deleted); load reads it back on restart
+    // so deleted nodes are not revived
     for (i, (nid, neighbors, deleted)) in nodes.iter().enumerate() {
         buf[ids_cursor..ids_cursor + 8].copy_from_slice(&nid.to_le_bytes());
         ids_cursor += 8;
@@ -90,7 +93,7 @@ pub fn serialize(graph: &NswGraph) -> Vec<u8> {
         }
         buf[flags_off + i] = if *deleted { 1 } else { 0 };
     }
-    // CRC 覆盖 ids+offsets+edges+flags（header 不含，crc 字段 [20..24] 自身不含）
+    // CRC covers ids+offsets+edges+flags (header excluded, and the crc field [20..24] itself excluded)
     let body = &buf[ids_off..total];
     let crc = crc32_finalize(crc32_update(0xFFFF_FFFF, body));
     buf[20..24].copy_from_slice(&crc.to_le_bytes());
@@ -103,10 +106,11 @@ pub fn serialize(graph: &NswGraph) -> Vec<u8> {
     buf
 }
 
-/// 持久化 snapshot 字节到单 mmap 段文件（原子 tmp+fsync+rename，E3）
+/// Persist snapshot bytes to a single mmap segment file (atomic tmp+fsync+rename, E3)
 ///
-/// 绝不就地覆盖在线文件：先写 `.tmp` → fsync → atomic rename → fsync dir。
-/// 崩溃发生在任一点，要么旧文件完整、要么新文件完整，无半写撕裂。
+/// Never overwrite the live file in place: write `.tmp` → fsync → atomic
+/// rename → fsync dir. If a crash happens at any point, either the old file is
+/// intact or the new file is complete — no torn half-write.
 pub fn persist(dir: &Path, bytes: &[u8]) -> Result<()> {
     std::fs::create_dir_all(dir)?;
     let path = dir.join(SNAPSHOT_FILE);
@@ -123,10 +127,12 @@ pub fn persist(dir: &Path, bytes: &[u8]) -> Result<()> {
     mmap.flush()?;
     drop(mmap);
     file.sync_all()?;
-    // 原子切换：rename(tmp -> live)，再 fsync 目录使 rename 落盘
+    // Atomic switch: rename(tmp -> live), then fsync the directory to make the rename durable
     std::fs::rename(&tmp_path, &path)?;
-    // F-ERR-3：dir fsync 使 rename 元数据落盘。失败不致命（文件已 rename 成功，下次 checkpoint
-    // 再 fsync），但崩溃窗口内 rename 可能未落盘 → 回滚到旧 snapshot；显式 error 告警供运维察觉。
+    // F-ERR-3: dir fsync makes the rename metadata durable. Failure is not fatal (the file
+    // already renamed successfully; the next checkpoint will fsync again), but within the
+    // crash window the rename may not have hit disk → rollback to the old snapshot. An
+    // explicit error is logged so operators notice.
     if let Ok(dirf) = File::open(dir) {
         if let Err(e) = dirf.sync_all() {
             tracing::error!(
@@ -140,9 +146,10 @@ pub fn persist(dir: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// 从 mmap 段文件重载图拓扑（重启恢复，H1）
+/// Reload graph topology from the mmap segment file (restart recovery, H1)
 ///
-/// 全边界检查：任一字段越界 → Err(Corrupt)，绝不 panic。校验 CRC32 —— 拒截断/半写。
+/// Full bounds checking: any out-of-range field → Err(Corrupt), never panic.
+/// CRC32 is verified — truncation/half-writes are rejected.
 pub fn load(dir: &Path) -> Result<Option<NswGraph>> {
     let path = dir.join(SNAPSHOT_FILE);
     if !path.exists() {
@@ -192,7 +199,7 @@ pub fn load(dir: &Path) -> Result<Option<NswGraph>> {
             total
         )));
     }
-    // CRC 覆盖 body（ids+offsets+edges+flags），header[20..24] crc 自身除外
+    // CRC covers the body (ids+offsets+edges+flags), excluding header[20..24] where the crc itself lives
     let body = &bytes[ids_off..total];
     let calc_crc = crc32_finalize(crc32_update(0xFFFF_FFFF, body));
     if calc_crc != stored_crc {
@@ -254,8 +261,10 @@ pub fn load(dir: &Path) -> Result<Option<NswGraph>> {
         graph.restore_node(id, neighbors, deleted);
     }
     graph.restore_entry_point(entry_point);
-    // E4：CRC 只防字节损坏；此处校验图结构语义——无悬边、入口点有效。
-    // count 碰巧一致但内容损坏（如手工篡改后的合法 CSR）会被此层拦截，不静默加载坏图。
+    // E4: CRC only guards against byte corruption; this validates graph-structure semantics —
+    // no dangling edges, entry point valid. A graph whose counts happen to match but whose
+    // content is corrupted (e.g. a hand-tampered yet valid CSR) is caught here instead of
+    // silently loading a bad graph.
     graph.validate_edges()?;
     tracing::info!(
         node_count,
@@ -273,7 +282,7 @@ mod tests {
     #[test]
     fn snapshot_roundtrip_preserves_topology() {
         let mut g = NswGraph::new();
-        // 插 3 节点（手工，不需向量——纯拓扑测试）
+        // Insert 3 nodes manually (no vectors needed — pure topology test)
         g.restore_node(10, vec![11, 12], false);
         g.restore_node(11, vec![10], false);
         g.restore_node(12, vec![10], false);
@@ -282,9 +291,9 @@ mod tests {
         let dir = tempdir().unwrap();
         persist(dir.path(), &bytes).unwrap();
         let loaded = load(dir.path()).unwrap().unwrap();
-        // len 计未删节点
+        // len counts non-deleted nodes
         assert_eq!(loaded.len(), 3);
-        // 拓扑：节点 10 邻居含 11,12
+        // Topology: node 10 neighbors include 11,12
         let snap = loaded.snapshot_nodes();
         let n10 = snap.iter().find(|(id, _)| *id == 10).unwrap();
         assert!(n10.1.contains(&11) && n10.1.contains(&12));
@@ -296,26 +305,26 @@ mod tests {
         assert!(load(dir.path()).unwrap().is_none());
     }
 
-    // L7：snapshot 持久化软删标记，重启后 deleted 节点不复活
+    // L7: snapshot persists soft-delete flags; deleted nodes are not revived after restart
     #[test]
     fn snapshot_roundtrip_preserves_deleted_flags() {
         let mut g = NswGraph::new();
         g.restore_node(1, vec![2, 3], false);
-        g.restore_node(2, vec![1], true); // 软删
+        g.restore_node(2, vec![1], true); // soft-deleted
         g.restore_node(3, vec![1], false);
         g.restore_entry_point(1);
         let bytes = serialize(&g);
         let dir = tempdir().unwrap();
         persist(dir.path(), &bytes).unwrap();
         let loaded = load(dir.path()).unwrap().unwrap();
-        // len 计未删 → 2（1,3 活，2 删）
+        // len counts non-deleted → 2 (1,3 alive, 2 deleted)
         assert_eq!(loaded.len(), 2);
         assert!(loaded.is_deleted(2));
         assert!(!loaded.is_deleted(1));
         assert!(!loaded.is_deleted(3));
     }
 
-    // E3：CRC 不匹配拒收（body 被篡改），不 panic 不返回坏图
+    // E3: CRC mismatch rejects the file (tampered body), no panic, no bad graph returned
     #[test]
     fn load_rejects_corrupt_body_via_crc() {
         let mut g = NswGraph::new();
@@ -325,7 +334,7 @@ mod tests {
         let bytes = serialize(&g);
         let dir = tempdir().unwrap();
         persist(dir.path(), &bytes).unwrap();
-        // 篡改 body 第一字节（node_ids 区），不碰 crc 字段
+        // Tamper with the first body byte (node_ids region), leaving the crc field untouched
         let path = dir.path().join(SNAPSHOT_FILE);
         let mut corrupted = std::fs::read(&path).unwrap();
         corrupted[28] ^= 0xFF;
@@ -337,7 +346,7 @@ mod tests {
         }
     }
 
-    // E3：截断文件拒收（半写场景），不 panic
+    // E3: truncated file is rejected (half-write scenario), no panic
     #[test]
     fn load_rejects_truncated_file() {
         let mut g = NswGraph::new();
@@ -347,7 +356,7 @@ mod tests {
         let bytes = serialize(&g);
         let dir = tempdir().unwrap();
         persist(dir.path(), &bytes).unwrap();
-        // 截断到一半
+        // Truncate to half
         let path = dir.path().join(SNAPSHOT_FILE);
         let full = std::fs::read(&path).unwrap();
         std::fs::write(&path, &full[..full.len() / 2]).unwrap();
@@ -358,7 +367,7 @@ mod tests {
         }
     }
 
-    // E3：头部过小拒收
+    // E3: too-small header is rejected
     #[test]
     fn load_rejects_tiny_header() {
         let dir = tempdir().unwrap();
@@ -370,12 +379,13 @@ mod tests {
         }
     }
 
-    // E4：悬边拒收 —— node_count 与 locator 数碰巧一致但边指向不存在节点，
-    // CRC 通过（字节合法）却图结构损坏。validate_edges 拦截，不静默加载坏图。
+    // E4: dangling edge is rejected — node_count happens to match the locator count but an edge
+    // points at a nonexistent node; CRC passes (bytes are valid) yet the graph structure is
+    // broken. validate_edges catches it instead of silently loading a bad graph.
     #[test]
     fn load_rejects_dangling_edge_via_validate() {
         let mut g = NswGraph::new();
-        g.restore_node(10, vec![11, 99], false); // 99 不在图 → 悬边
+        g.restore_node(10, vec![11, 99], false); // 99 not in graph → dangling edge
         g.restore_node(11, vec![10], false);
         g.restore_entry_point(10);
         let bytes = serialize(&g);
@@ -388,11 +398,11 @@ mod tests {
         }
     }
 
-    // E4：入口点被软删拒收 —— KNN 无合法起点
+    // E4: soft-deleted entry point is rejected — KNN has no valid starting point
     #[test]
     fn load_rejects_deleted_entry_point() {
         let mut g = NswGraph::new();
-        g.restore_node(10, vec![11], true); // 入口点软删
+        g.restore_node(10, vec![11], true); // entry point soft-deleted
         g.restore_node(11, vec![10], false);
         g.restore_entry_point(10);
         let bytes = serialize(&g);
@@ -405,13 +415,13 @@ mod tests {
         }
     }
 
-    // E4：非空图无入口点拒收
+    // E4: non-empty graph without an entry point is rejected
     #[test]
     fn load_rejects_nonempty_graph_no_entry_point() {
         let mut g = NswGraph::new();
         g.restore_node(10, vec![11], false);
         g.restore_node(11, vec![10], false);
-        // 不调 restore_entry_point → entry_point=None
+        // restore_entry_point never called → entry_point=None
         let bytes = serialize(&g);
         let dir = tempdir().unwrap();
         persist(dir.path(), &bytes).unwrap();

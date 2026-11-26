@@ -1,15 +1,20 @@
-//! KV 存储层 —— heed 持久化定位 + mmap payload 段 [v2 E1/E6]
+//! KV storage layer — heed-backed locators + mmap payload segments [v2 E1/E6]
 //!
-//! put_kv: payload 落段 → heed 存 (key -> ValueLocator) + 配额累加。
-//! get_kv_zero_copy: 读 heed locator → 映射封存段 → ZeroCopyBuffer（指针落 mmap 区域）。
-//! delete_kv: heed 删 locator，配额减。段不就地回收（H4），compact 整段重写回收（M4）。
-//! 多进程写: flock 快速失败（R1）。
+//! put_kv: payload lands in a segment → heed stores (key -> ValueLocator) + quota accumulates.
+//! get_kv_zero_copy: read the heed locator → map the sealed segment → ZeroCopyBuffer
+//! (pointer lands in the mmap region).
+//! delete_kv: heed deletes the locator, quota decrements. Segments are not reclaimed in
+//! place (H4); compact rewrites whole segments to reclaim (M4).
+//! Multi-process writes: flock fails fast (R1).
 //!
-//! 配额语义（P3）：quota_limit 限的是「逻辑 payload 字节」净增（覆盖减旧值加新值），
-//! 不计 append_aligned 的 padding、段未写满的尾空洞、heed 元数据。
-//! append-only 段每段 64MB 预分配，最后一未满段浪费可达 64MB×namespace 数。
-//! 故实际磁盘占用 = payload + padding + 段尾空洞 + heed > 配额计数。
-//! disk_bytes() 报真实段文件占用，/stats 暴露 quota-vs-disk 缺口供监控制约磁盘。
+//! Quota semantics (P3): quota_limit bounds the net growth of "logical payload bytes"
+//! (overwrite subtracts the old value and adds the new); it does not count
+//! append_aligned padding, the tail hole of a not-yet-full segment, or heed metadata.
+//! Append-only segments preallocate 64MB each, so the last unfilled segment can waste up
+//! to 64MB × namespace count.
+//! Thus actual disk usage = payload + padding + segment tail hole + heed > quota counter.
+//! disk_bytes() reports real segment-file usage; /stats exposes the quota-vs-disk gap
+//! for monitoring to keep disk in check.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -24,20 +29,24 @@ use crate::mem::mmap::ZeroCopyBuffer;
 use crate::mem::segment::{SegmentPool, ValueLocator};
 use crate::StoreError;
 
-/// KV value 一律落 mmap 段（零拷贝读指针断言对齐 §1.4）
+/// KV values always land in mmap segments (zero-copy read pointer assertion, aligned with §1.4)
 const KV_DB_NAME: &str = "kv_locators";
-/// namespace 配额计数 DB（key=固定 "used" -> u64 字节）
+/// namespace quota counter DB (key = fixed "used" -> u64 bytes)
 const QUOTA_DB_NAME: &str = "kv_quota";
 const QUOTA_KEY: &[u8] = b"used";
 
-/// E8：heed map_size 上限。locator 12B/项，2GB ≈ 1.8 亿 key（远超企业级 KV namespace）。
-/// Apple Silicon 虚拟地址空间巨大，2GB 预分配零物理内存成本（按需分页）。
-/// 写满抛 MapFull（非 panic），caller 据此告警或重建更大 map_size。
+/// E8: heed map_size cap. Locators are 12B/entry; 2GB ≈ 180M keys (far beyond an
+/// enterprise KV namespace).
+/// Apple Silicon's virtual address space is huge, so a 2GB preallocation costs zero
+/// physical memory (demand paging).
+/// A full map surfaces MapFull (not a panic); callers can alert or rebuild with a larger
+/// map_size.
 const KV_MAP_SIZE: usize = 2 * 1024 * 1024 * 1024;
 
-// E8：把 heed Error 中的 MapFull 提升为显式 StoreError::MapFull，caller 可据容量告警。
-// 非 MapFull 的 heed 错误原样透传为 StoreError::Heed。返回裸 StoreError，caller 用 Err() 包，
-// 以适配不同返回类型（put_kv_inner Result<()>，delete_kv_inner Result<bool>）。
+// E8: promote MapFull inside a heed Error into an explicit StoreError::MapFull so callers
+// can alert on capacity. Non-MapFull heed errors pass through as StoreError::Heed. Returns
+// a bare StoreError for the caller to wrap in Err(), fitting the differing return types
+// (put_kv_inner Result<()>, delete_kv_inner Result<bool>).
 fn classify_heed(e: heed::Error) -> StoreError {
     match e {
         heed::Error::Mdb(heed::MdbError::MapFull) => StoreError::MapFull {
@@ -48,9 +57,9 @@ fn classify_heed(e: heed::Error) -> StoreError {
     }
 }
 
-/// KV 存储 —— 单 namespace
+/// KV storage — single namespace
 ///
-/// writer 持 flock 单进程排他；reader 无锁（heed MVCC）。
+/// The writer holds an exclusive per-process flock; readers are lock-free (heed MVCC).
 pub struct KvStore {
     env: Env,
     kv_db: Database<Bytes, Bytes>,
@@ -61,8 +70,8 @@ pub struct KvStore {
 }
 
 impl KvStore {
-    /// 打开/创建 KV store。data_dir = <ns>/kv_data, meta_dir = <ns>/kv_meta
-    /// 与 VectorIndex 的 vec_meta/vec_data 隔离——heed 禁同路径双 Env [v2 E1]
+    /// Open/create the KV store. data_dir = <ns>/kv_data, meta_dir = <ns>/kv_meta
+    /// Isolated from VectorIndex's vec_meta/vec_data — heed forbids two Envs on one path [v2 E1]
     pub fn open(namespace_dir: &Path, seg_size: u64, quota_limit: u64) -> Result<Self> {
         let data_dir = namespace_dir.join("kv_data");
         let meta_dir = namespace_dir.join("kv_meta");
@@ -73,8 +82,9 @@ impl KvStore {
             EnvOpenOptions::new()
                 .map_size(KV_MAP_SIZE)
                 .max_dbs(crate::HEED_MAX_DBS)
-                // NO_SYNC：heed 仅存 locator 元数据（tiny），commit 不 fsync；
-                // WAL 是唯一 crash-safe 同步点（H5），crash 后 WAL 重放补 heed 未刷条目
+                // NO_SYNC: heed stores only (tiny) locator metadata; commit does not fsync.
+                // The WAL is the sole crash-safe sync point (H5); after a crash, WAL replay
+                // backfills entries heed had not flushed
                 .flags(heed::EnvFlags::NO_SYNC)
                 .open(&meta_dir)?
         };
@@ -86,14 +96,14 @@ impl KvStore {
 
         let pool = SegmentPool::open(&data_dir, seg_size)?;
 
-        // flock 多进程写互斥（try_lock，拿不到快速失败 R1）
+        // flock multi-process write exclusion (try_lock; fail fast if unavailable, R1)
         let lock_file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .open(&lock_path)?;
-        // 仅 writer 路径拿排他锁；open 时不锁，put/delete 时锁
+        // Only the writer path takes the exclusive lock; not locked at open, locked at put/delete
 
         tracing::info!(dir = ?namespace_dir, quota_limit, "kv store opened");
         Ok(Self {
@@ -106,10 +116,11 @@ impl KvStore {
         })
     }
 
-    /// 拿写锁（E9：阻塞 flock，非轮询）
-    /// None = 内核阻塞 `lock_exclusive`，拿到为止（内核唤醒，零 CPU 空转）。
-    /// Some(d) = 限时等待：fs2 无 timed-lock 原语，用 try + 5ms 短睡循环逼近 deadline
-    ///   （5ms 粒度较旧 50ms 抖动降 10×，仍非零 CPU；纯阻塞路径 None 覆盖常态）。
+    /// Acquire the write lock (E9: blocking flock, not polling)
+    /// None = kernel-blocking `lock_exclusive` until acquired (kernel wake, zero CPU spin).
+    /// Some(d) = time-bounded wait: fs2 has no timed-lock primitive, so approximate the
+    /// deadline with try + a 5ms short-sleep loop (5ms granularity cuts the old 50ms
+    /// jitter 10×, still non-zero CPU; the pure blocking path via None covers the norm).
     fn acquire_write_lock(&self, timeout: Option<Duration>) -> Result<()> {
         match timeout {
             None => self
@@ -125,7 +136,7 @@ impl KvStore {
                     if waited >= d {
                         return Err(StoreError::LockBusy);
                     }
-                    // E9：5ms 粒度短睡，旧 50ms 抖动降 10×；try 失败极短退避
+                    // E9: 5ms-granularity short sleep cuts the old 50ms jitter 10×; very short backoff on failed try
                     std::thread::sleep(Duration::from_millis(5));
                     waited += Duration::from_millis(5);
                 }
@@ -133,18 +144,18 @@ impl KvStore {
         }
     }
 
-    /// 写 KV —— payload 落段 + heed 存 locator + 配额累加
+    /// Write KV — payload lands in a segment + heed stores the locator + quota accumulates
     pub fn put_kv(&self, key: &[u8], value: &[u8], timeout: Option<Duration>) -> Result<()> {
         self.acquire_write_lock(timeout)?;
         let res = self.put_kv_inner(key, value);
-        // 释放写锁
+        // Release the write lock
         let _ = self.lock_file.unlock();
         res
     }
 
     fn put_kv_inner(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        // F-TEST-2：空 key / 超 MDB_MAXKEYSIZE key 显式拒（Rule 12 fail visibly）
-        // LMDB 默认页大小 4096 → MDB_MAXKEYSIZE = 511。空 key 直接 BadValSize。
+        // F-TEST-2: reject empty keys / keys above MDB_MAXKEYSIZE explicitly (Rule 12: fail visibly)
+        // LMDB default page size 4096 → MDB_MAXKEYSIZE = 511. Empty keys hit BadValSize directly.
         if key.is_empty() {
             return Err(StoreError::InvalidKey("empty key rejected"));
         }
@@ -156,7 +167,8 @@ impl KvStore {
         }
         let start = std::time::Instant::now();
         let mut wtxn = self.env.write_txn()?;
-        // 单写事务内完成：读旧值（覆盖时减配额）+ 配额校验 + 写 locator + 写配额
+        // Complete within a single write txn: read old value (subtract from quota on
+        // overwrite) + quota check + write locator + write quota
         let old_len: u64 = if let Some(old_loc_bytes) = self.kv_db.get(&wtxn, key)? {
             let old_loc: ValueLocator = bindecode(old_loc_bytes)?;
             old_loc.len as u64
@@ -164,7 +176,7 @@ impl KvStore {
             0
         };
         let used = read_quota_txn(&self.quota_db, &wtxn)?;
-        // 减旧 value 长度再加新 —— 覆盖语义下配额按净增计
+        // Subtract the old value length before adding the new — under overwrite semantics the quota counts net growth
         let net = (value.len() as u64).saturating_sub(old_len);
         let new_used = used.checked_add(net).ok_or(StoreError::QuotaExceeded)?;
         if self.quota_limit > 0 && new_used > self.quota_limit {
@@ -179,21 +191,21 @@ impl KvStore {
             return Err(StoreError::QuotaExceeded);
         }
 
-        // payload 落段
+        // Land the payload in a segment
         let loc = {
             let mut pool = self.pool.lock().map_err(|_| StoreError::LockPoisoned)?;
             pool.append(value)?
         };
-        // locator 序列化落 heed
+        // Serialize the locator into heed
         let loc_bytes = binencode(&loc)?;
         self.kv_db.put(&mut wtxn, key, &loc_bytes)?;
         write_quota_txn(&self.quota_db, &mut wtxn, new_used)?;
-        // L1：commit 失败回滚已落段字节，免段内泄漏
+        // L1: a failed commit rolls back already-landed segment bytes, avoiding in-segment leaks
         if let Err(e) = wtxn.commit() {
             tracing::warn!(key_hash = fnv1a(key), err = ?e, "put_kv commit failed, rewinding segment");
             if let Ok(mut pool) = self.pool.lock() {
                 if let Err(re) = pool.rewind_active_to(loc.seg_id, loc.offset) {
-                    // F-ERR-2：rewind 失败段内留垃圾，显式告警供运维介入
+                    // F-ERR-2: a failed rewind leaves garbage in the segment; alert loudly for operator intervention
                     tracing::error!(
                         key_hash = fnv1a(key),
                         seg = loc.seg_id,
@@ -203,7 +215,7 @@ impl KvStore {
                     );
                 }
             }
-            // E8：MapFull 单独报，caller 可据容量告警
+            // E8: MapFull reported distinctly so callers can alert on capacity
             return Err(classify_heed(e));
         }
 
@@ -218,7 +230,7 @@ impl KvStore {
         Ok(())
     }
 
-    /// 零拷贝读 KV —— 指针落 mmap 段区域
+    /// Zero-copy KV read — pointer lands in the mmap segment region
     pub fn get_kv_zero_copy(
         &self,
         key: &[u8],
@@ -245,7 +257,7 @@ impl KvStore {
         Ok(Some(buf))
     }
 
-    /// 删 KV —— heed 删 locator，配额减
+    /// Delete KV — heed deletes the locator, quota decrements
     pub fn delete_kv(&self, key: &[u8], timeout: Option<Duration>) -> Result<bool> {
         self.acquire_write_lock(timeout)?;
         let res = self.delete_kv_inner(key);
@@ -269,7 +281,7 @@ impl KvStore {
         let used = read_quota_txn(&self.quota_db, &wtxn)?;
         let new_used = used.saturating_sub(old_len);
         write_quota_txn(&self.quota_db, &mut wtxn, new_used)?;
-        // E8：commit 的 MapFull 单独报
+        // E8: MapFull on commit reported distinctly
         if let Err(e) = wtxn.commit() {
             return Err(classify_heed(e));
         }
@@ -277,25 +289,26 @@ impl KvStore {
         Ok(deleted)
     }
 
-    /// 当前 namespace 已用字节
+    /// Current namespace used bytes
     pub fn used_bytes(&self) -> Result<u64> {
         let rtxn = self.env.read_txn()?;
         read_quota_txn(&self.quota_db, &rtxn)
     }
 
-    /// 配额上限
+    /// Quota limit
     pub fn quota_limit(&self) -> u64 {
         self.quota_limit
     }
 
-    /// 实际段文件磁盘占用（P3：含 padding/段尾空洞，对比 used_bytes 净 payload）
+    /// Actual segment-file disk usage (P3: includes padding/segment tail holes, vs used_bytes net payload)
     pub fn disk_bytes(&self) -> Result<u64> {
         let pool = self.pool.lock().map_err(|_| StoreError::LockPoisoned)?;
         pool.disk_bytes()
     }
 
-    /// 有序落盘：flush active 段 + heed force_sync（A6 close 用）
-    /// NO_SYNC 下 commit 不 fsync；close 显式 force_sync 保证元数据落盘。
+    /// Orderly flush: flush the active segment + heed force_sync (used by A6 close)
+    /// Under NO_SYNC, commit does not fsync; close's explicit force_sync guarantees
+    /// metadata durability.
     pub fn flush(&self) -> Result<()> {
         let mut pool = self.pool.lock().map_err(|_| StoreError::LockPoisoned)?;
         pool.flush()?;
@@ -305,7 +318,7 @@ impl KvStore {
     }
 }
 
-// —— 配额读写：txn 参数化，支持在写事务内复用 ——
+// —— Quota read/write: txn-parameterized so it can be reused inside a write txn ——
 fn read_quota_txn(db: &Database<Bytes, Bytes>, txn: &RoTxn) -> Result<u64> {
     if let Some(bytes) = db.get(txn, QUOTA_KEY)? {
         if bytes.len() == 8 {
@@ -325,7 +338,7 @@ fn write_quota_txn(db: &Database<Bytes, Bytes>, wtxn: &mut RwTxn, val: u64) -> R
     Ok(())
 }
 
-// —— 编解码小工具：ValueLocator 用紧凑定长 12 字节，不走 serde_json 体积 ——
+// —— Encoding helpers: ValueLocator uses a compact fixed 12-byte form, skipping serde_json size ——
 fn binencode(loc: &ValueLocator) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(12);
     out.extend_from_slice(&loc.seg_id.to_le_bytes());
@@ -351,7 +364,7 @@ fn bindecode(bytes: &[u8]) -> Result<ValueLocator> {
     })
 }
 
-/// 轻量 key hash（日志用，不明文记 key）—— FNV-1a，非安全用途
+/// Lightweight key hash for logs (keys never logged in plaintext) — FNV-1a, not for security
 fn fnv1a(key: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for &b in key {
@@ -390,7 +403,7 @@ mod tests {
         let key = b"zk";
         let val = b"zero-copy-payload-into-mmap-region";
         store.put_kv(key, val, None).unwrap();
-        // 触发封存使 payload 进封存段
+        // Force sealing so the payload lands in a sealed segment
         for i in 0..32 {
             store
                 .put_kv(format!("fill{}", i).as_bytes(), &[0u8; 64], None)
@@ -398,14 +411,14 @@ mod tests {
         }
         let buf = store.get_kv_zero_copy(key, None).unwrap().unwrap();
         assert_eq!(buf.as_bytes(), val);
-        // 指针有效性已在 ZeroCopyBuffer 内保证；此处校验数据正确即可
+        // Pointer validity is guaranteed inside ZeroCopyBuffer; verifying data correctness here suffices
     }
 
     #[test]
     fn quota_exceeded_rejects_put() {
         let dir = tempdir().unwrap();
         let store = open_store(dir.path(), 64);
-        // 配额 64 字节
+        // Quota of 64 bytes
         store.put_kv(b"a", &[0u8; 32], None).unwrap();
         let err = store.put_kv(b"b", &[0u8; 64], None).unwrap_err();
         assert!(matches!(err, StoreError::QuotaExceeded));
@@ -421,7 +434,7 @@ mod tests {
         assert_eq!(store.used_bytes().unwrap(), 0);
     }
 
-    // E8：classify_heed 把 heed MapFull 提升为显式 StoreError::MapFull（非 panic）
+    // E8: classify_heed promotes heed MapFull into an explicit StoreError::MapFull (not a panic)
     #[test]
     fn classify_heed_promotes_mapfull() {
         let e = heed::Error::Mdb(heed::MdbError::MapFull);
@@ -436,8 +449,9 @@ mod tests {
 
     #[test]
     fn disk_bytes_exceeds_used_bytes_with_tail_hole() {
-        // P3：配额计净 payload，disk_bytes 计段文件实际占用（含段尾空洞）。
-        // 写 32B payload，段预分配 64MB → disk_bytes 远大于 used_bytes。
+        // P3: quota counts net payload while disk_bytes counts actual segment-file usage
+        // (including tail holes). Writing 32B of payload with a 64MB preallocated segment
+        // leaves disk_bytes far above used_bytes.
         let dir = tempdir().unwrap();
         let store = open_store(dir.path(), 0);
         store.put_kv(b"a", &[0u8; 32], None).unwrap();
@@ -450,7 +464,7 @@ mod tests {
             disk,
             used
         );
-        // 64MB 默认段 → disk 至少 64MB（段尾空洞占据 quota-vs-disk 缺口）
+        // 64MB default segment → disk at least 64MB (segment tail hole fills the quota-vs-disk gap)
         assert!(
             disk >= 64 * 1024 * 1024,
             "disk_bytes {} >= 64MB default segment prealloc",

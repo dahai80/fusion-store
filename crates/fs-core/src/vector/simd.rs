@@ -1,13 +1,15 @@
-//! SIMD 距离 —— NEON 与标量位等 [v2 R4]
+//! SIMD distances — NEON and scalar are bit-equivalent [v2 R4]
 //!
-//! 位等约束：同输入同输出到 bit 级，召回率测试对暴力 KNN 可复现。
-//! 实现约束：NEON 用与标量相同求和顺序（成对累加不重排），
-//! build profile 强制 opt-level=1 禁激进重排。支持 cosine / L2 / dot。
-//! 按 VectorSchema.metric 固定一种（§1.4）。
+//! Bit-equivalence constraint: same input yields bit-identical output, so
+//! recall tests remain reproducible against brute-force KNN.
+//! Implementation constraint: NEON uses the same summation order as scalar
+//! (pairwise accumulation, no reordering), and the build profile forces
+//! opt-level=1 to forbid aggressive reordering. Supports cosine / L2 / dot.
+//! One metric is fixed per index via VectorSchema.metric (§1.4).
 
 use crate::vector::schema::MetricKind;
 
-/// 计算两向量距离（按 metric 选）。SIMD 与标量位等。
+/// Compute the distance between two vectors (selected by metric). SIMD and scalar are bit-equivalent.
 pub fn distance(metric: MetricKind, a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len(), "distance: dim mismatch");
     match metric {
@@ -17,13 +19,14 @@ pub fn distance(metric: MetricKind, a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
-/// 点积 —— 4-lane 累加，NEON 与标量同序同结构 [v2 R4 位等]
+/// Dot product — 4-lane accumulation, NEON matches scalar order and structure [v2 R4 bit-equiv]
 ///
-/// NEON 用 vmulq + vaddq（非 fused，每步独立舍入），与标量 4-accumulator
-/// (a[i]*b[i] 后 +=) 运算序列逐位等价 → 同输入同输出到 bit 级。
-/// NEON 4-wide 处理，标量 1-wide 处理（同 4 累加器结构）→ NEON ≥3x 快。
+/// NEON uses vmulq + vaddq (not fused, independent rounding per step), which
+/// is bit-for-bit equivalent to the scalar 4-accumulator sequence
+/// (a[i]*b[i] then +=) → same input yields bit-identical output.
+/// NEON processes 4-wide, scalar 1-wide (same 4-accumulator structure) → NEON is ≥3x faster.
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
-    // aarch64 全系含 NEON（Apple Silicon 默认），直接走 NEON；他架构标量
+    // All aarch64 targets include NEON (default on Apple Silicon), so go straight to NEON; scalar elsewhere
     #[cfg(target_arch = "aarch64")]
     {
         unsafe { dot_neon(a, b) }
@@ -44,12 +47,12 @@ unsafe fn dot_neon(a: &[f32], b: &[f32]) -> f32 {
     while i + 4 <= n {
         let va = vld1q_f32(a[i..].as_ptr());
         let vb = vld1q_f32(b[i..].as_ptr());
-        // 非 fused：先乘（舍入）后加（舍入），与标量 a[i]*b[i] 后 += 等价
+        // Not fused: multiply (round) then add (round), equivalent to scalar a[i]*b[i] then +=
         let prod = vmulq_f32(va, vb);
         acc = vaddq_f32(acc, prod);
         i += 4;
     }
-    // 横向归约 acc[0..4] —— 与标量 (sum0+sum1)+(sum2+sum3) 同序
+    // Horizontal reduction of acc[0..4] — same order as scalar (sum0+sum1)+(sum2+sum3)
     let s0 = vgetq_lane_f32(acc, 0);
     let s1 = vgetq_lane_f32(acc, 1);
     let s2 = vgetq_lane_f32(acc, 2);
@@ -62,7 +65,7 @@ unsafe fn dot_neon(a: &[f32], b: &[f32]) -> f32 {
     sum
 }
 
-/// 标量点积 —— NEON 位等对照基准（bit-equiv test 直接调用）
+/// Scalar dot product — bit-equivalence baseline for NEON (called directly by bit-equiv tests)
 #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
     let n = a.len();
@@ -71,7 +74,7 @@ fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
     let mut sum2 = 0.0f32;
     let mut sum3 = 0.0f32;
     let mut i = 0;
-    // 4 路展开，结构同 NEON：逐乘后累加，顺序等价
+    // 4-way unrolled, same structure as NEON: multiply then accumulate, same order
     while i + 4 <= n {
         sum0 += a[i] * b[i];
         sum1 += a[i + 1] * b[i + 1];
@@ -87,7 +90,7 @@ fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
     s
 }
 
-/// cosine 距离 = 1 - dot(a,b)/(|a|*|b|)
+/// cosine distance = 1 - dot(a,b)/(|a|*|b|)
 pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
     let d = dot(a, b);
     let na = dot(a, a).sqrt();
@@ -99,12 +102,13 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
     1.0 - d / denom
 }
 
-/// L2 平方距离 = sum((a-b)^2)
+/// Squared L2 distance = sum((a-b)^2)
 ///
-/// NEON 与标量位等 [v2 R4]：sub→mul→add 非融合（每步独立舍入），
-/// 4-lane 累加顺序同标量 4-accumulator（(sum0+sum1)+(sum2+sum3)）。
+/// NEON and scalar are bit-equivalent [v2 R4]: sub→mul→add not fused
+/// (independent rounding per step), 4-lane accumulation order matches the
+/// scalar 4-accumulator ((sum0+sum1)+(sum2+sum3)).
 pub fn l2(a: &[f32], b: &[f32]) -> f32 {
-    // aarch64 NEON；他架构标量
+    // aarch64 uses NEON; scalar elsewhere
     #[cfg(target_arch = "aarch64")]
     {
         unsafe { l2_neon(a, b) }
@@ -125,12 +129,12 @@ unsafe fn l2_neon(a: &[f32], b: &[f32]) -> f32 {
     while i + 4 <= n {
         let va = vld1q_f32(a[i..].as_ptr());
         let vb = vld1q_f32(b[i..].as_ptr());
-        // d = a - b（独立舍入）；acc += d*d（非 fused：先乘舍入后加舍入）
+        // d = a - b (independent rounding); acc += d*d (not fused: multiply-round then add-round)
         let d = vsubq_f32(va, vb);
         acc = vmlaq_f32(acc, d, d);
         i += 4;
     }
-    // 横向归约同标量序 (s0+s1)+(s2+s3)
+    // Horizontal reduction in scalar order (s0+s1)+(s2+s3)
     let s0 = vgetq_lane_f32(acc, 0);
     let s1 = vgetq_lane_f32(acc, 1);
     let s2 = vgetq_lane_f32(acc, 2);
@@ -144,7 +148,7 @@ unsafe fn l2_neon(a: &[f32], b: &[f32]) -> f32 {
     sum
 }
 
-/// 标量 L2 —— NEON 位等对照基准（bit-equiv test 直接调用）
+/// Scalar L2 — bit-equivalence baseline for NEON (called directly by bit-equiv tests)
 #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 fn l2_scalar(a: &[f32], b: &[f32]) -> f32 {
     let n = a.len();
@@ -153,7 +157,7 @@ fn l2_scalar(a: &[f32], b: &[f32]) -> f32 {
     let mut sum2 = 0.0f32;
     let mut sum3 = 0.0f32;
     let mut i = 0;
-    // 4 路展开，结构同 NEON：sub→mul→add 逐舍入，顺序等价
+    // 4-way unrolled, same structure as NEON: sub→mul→add with per-step rounding, same order
     while i + 4 <= n {
         let d0 = a[i] - b[i];
         let d1 = a[i + 1] - b[i + 1];
@@ -241,15 +245,15 @@ mod tests {
 
     #[test]
     fn neon_and_scalar_bit_equivalent() {
-        // R4 位等：NEON 与标量同输入 → 同输出到 bit 级
-        // 用非整数值触发舍入差异，验证逐位一致
+        // R4 bit-equivalence: same input to NEON and scalar → bit-identical output
+        // Use non-integer values to trigger rounding differences, verify bit-level equality
         let a = [
             0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 1.1, 2.2, 3.3, 4.4,
         ];
         let b = [1.5, 2.7, 3.9, 4.1, 5.2, 6.3, 7.4, 8.5, 0.9, 1.8, 2.7, 3.6];
         let neon_d = dot(&a, &b);
         let scalar_d = dot_scalar(&a, &b);
-        // bit 级断言：to_bits 完全相等
+        // Bit-level assertion: to_bits must be exactly equal
         assert_eq!(
             neon_d.to_bits(),
             scalar_d.to_bits(),
@@ -259,7 +263,7 @@ mod tests {
 
     #[test]
     fn l2_neon_and_scalar_bit_equivalent() {
-        // R4 位等：L2 NEON 与标量同输入 → 同输出到 bit 级
+        // R4 bit-equivalence: same input to L2 NEON and scalar → bit-identical output
         let a = [
             0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 1.1, 2.2, 3.3, 4.4, 5.5, 6.6, 7.7, 8.8, 9.9,
         ];

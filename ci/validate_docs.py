@@ -129,40 +129,40 @@ TIER1_MIN_COUNT = {
 # Banned words (kept in sync with guidelines/writing-style.md section 4;
 # Chinese core terms live here, English terms in the separate list below)
 FORBIDDEN_ZH = [
-    "强大的",
-    "十分强大",
-    "业界领先",
-    "行业领先",
-    "领先的",
-    "极致的",
-    "极致",
-    "完美的",
-    "完美",
-    "顶级",
-    "顶尖",
-    "最强",
-    "首屈一指",
-    "革命性",
-    "颠覆性",
-    "颠覆",
-    "划时代",
-    "里程碑",
-    "黑科技",
-    "一站式",
-    "全场景",
-    "全栈赋能",
-    "赋能",
-    "闭环打通",
-    "打通",
-    "无与伦比",
-    "卓越",
-    "惊艳",
-    "灵动",
-    "丝滑",
-    "无缝",
-    "海量",
-    "超高",
-    "超低",
+    "强大的",  # i18n: user-facing (zh doc lint blocklist)
+    "十分强大",  # i18n: user-facing (zh doc lint blocklist)
+    "业界领先",  # i18n: user-facing (zh doc lint blocklist)
+    "行业领先",  # i18n: user-facing (zh doc lint blocklist)
+    "领先的",  # i18n: user-facing (zh doc lint blocklist)
+    "极致的",  # i18n: user-facing (zh doc lint blocklist)
+    "极致",  # i18n: user-facing (zh doc lint blocklist)
+    "完美的",  # i18n: user-facing (zh doc lint blocklist)
+    "完美",  # i18n: user-facing (zh doc lint blocklist)
+    "顶级",  # i18n: user-facing (zh doc lint blocklist)
+    "顶尖",  # i18n: user-facing (zh doc lint blocklist)
+    "最强",  # i18n: user-facing (zh doc lint blocklist)
+    "首屈一指",  # i18n: user-facing (zh doc lint blocklist)
+    "革命性",  # i18n: user-facing (zh doc lint blocklist)
+    "颠覆性",  # i18n: user-facing (zh doc lint blocklist)
+    "颠覆",  # i18n: user-facing (zh doc lint blocklist)
+    "划时代",  # i18n: user-facing (zh doc lint blocklist)
+    "里程碑",  # i18n: user-facing (zh doc lint blocklist)
+    "黑科技",  # i18n: user-facing (zh doc lint blocklist)
+    "一站式",  # i18n: user-facing (zh doc lint blocklist)
+    "全场景",  # i18n: user-facing (zh doc lint blocklist)
+    "全栈赋能",  # i18n: user-facing (zh doc lint blocklist)
+    "赋能",  # i18n: user-facing (zh doc lint blocklist)
+    "闭环打通",  # i18n: user-facing (zh doc lint blocklist)
+    "打通",  # i18n: user-facing (zh doc lint blocklist)
+    "无与伦比",  # i18n: user-facing (zh doc lint blocklist)
+    "卓越",  # i18n: user-facing (zh doc lint blocklist)
+    "惊艳",  # i18n: user-facing (zh doc lint blocklist)
+    "灵动",  # i18n: user-facing (zh doc lint blocklist)
+    "丝滑",  # i18n: user-facing (zh doc lint blocklist)
+    "无缝",  # i18n: user-facing (zh doc lint blocklist)
+    "海量",  # i18n: user-facing (zh doc lint blocklist)
+    "超高",  # i18n: user-facing (zh doc lint blocklist)
+    "超低",  # i18n: user-facing (zh doc lint blocklist)
 ]
 FORBIDDEN_EN = [
     "powerful",

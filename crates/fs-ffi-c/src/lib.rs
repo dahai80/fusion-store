@@ -1,18 +1,22 @@
-//! fs-ffi-c —— fusion-store C-ABI 绑定 [v2 §3.4/E3]
+//! fs-ffi-c — fusion-store C-ABI bindings [v2 §3.4/E3]
 //!
-//! 薄封装：类型转换 + 错误码映射，不含业务逻辑。cbindgen 生成 fs_store.h。
+//! Thin wrapper: type conversion + error code mapping, no business logic.
+//! cbindgen generates fs_store.h.
 //!
-//! A7 诚实定位：C-ABI 读路径**强制拷贝**——out_ids/out_dists/out_val 是 caller-owned
-//! buffer，Rust 拷贝填入，不暴露 mmap 指针 view。跨 C-ABI 零拷贝（返回 mmap 指针 +
-//! 保活句柄透出）生命周期复杂度高，本阶段不做。故 fusion-store 的「零拷贝」**仅在
-//! Rust 进程内有效**（mmap + Arc<MmapHandle> 保活）；C/Swift/Python 经此 C-ABI 读
-//! 是普通拷贝存储引擎，unified memory 零拷贝优势在 FFI 消费侧不存在。对外定位按
-//! 此修正，不宣称跨语言零拷贝。
+//! A7 honest positioning: the C-ABI read path **forces a copy** — out_ids/out_dists/out_val
+//! are caller-owned buffers filled in by Rust; no mmap pointer view is exposed. Zero-copy
+//! across the C-ABI (returning an mmap pointer plus a keep-alive handle) has high lifetime
+//! complexity and is out of scope for now. So fusion-store's "zero-copy" **only holds within
+//! a Rust process** (mmap + Arc<MmapHandle> keep-alive); C/Swift/Python reads via this C-ABI
+//! are plain copy-based engine operations — the unified-memory zero-copy advantage does not
+//! exist on the FFI consumer side. External positioning follows this correction; no
+//! cross-language zero-copy claims.
 //!
-//! 错误码：0=Ok，负数=StoreError 变体（见 err_code）。
+//! Error codes: 0 = Ok, negative = StoreError variant (see err_code).
 //!
-//! 目录布局：单 path 下 vec/kv 各占独立子目录（各自 heed env，避免同路径 Env 冲突）。
-//!   <path>/vec/{data,meta}   向量索引
+//! Directory layout: under a single path, vec/kv each get their own subdirectory
+//! (separate heed envs, avoiding same-path Env conflicts).
+//!   <path>/vec/{data,meta}   vector index
 //!   <path>/kv/{data,meta}    KV store
 
 use std::ffi::CStr;
@@ -22,12 +26,12 @@ use std::path::PathBuf;
 use fs_core::vector::schema::{MetricKind, VectorSchema};
 use fs_core::{Engine, FusionStoreEngine, StoreError};
 
-/// C 句柄 —— 持 Engine（聚合 KV+向量+列式+WAL，F1/A2）
+/// C handle — owns an Engine (aggregated KV + vector + columnar + WAL, F1/A2)
 pub struct FsStoreHandle {
     engine: Engine,
 }
 
-// —— 错误码映射 ——
+// ---- error code mapping ----
 const OK: c_int = 0;
 const ERR_IO: c_int = -1;
 const ERR_HEED: c_int = -2;
@@ -70,11 +74,12 @@ fn err_code(e: &StoreError) -> c_int {
     }
 }
 
-/// 新建 store：建向量索引（锁定 schema dim）+ KV store。
-/// dim=向量维度。path 不存在则创建。建后可用 fs_store_open 重开。
+/// Create a new store: builds the vector index (locking the schema dim) + KV store.
+/// dim = vector dimension. Creates `path` if it does not exist. Reopen later with fs_store_open.
 ///
 /// # Safety
-/// path 须为合法 C 字符串（NUL 结尾）。out 接收堆分配句柄，caller 用 fs_store_close 释放。
+/// `path` must be a valid C string (NUL-terminated). `out` receives a heap-allocated
+/// handle; the caller frees it with fs_store_close.
 #[no_mangle]
 pub unsafe extern "C" fn fs_store_create(
     path: *const c_char,
@@ -102,10 +107,12 @@ pub unsafe extern "C" fn fs_store_create(
     OK
 }
 
-/// 打开已存在 store：Engine::open(None) 重开 KV+向量（从持久化 schema 恢复）+ 自动 recover。
+/// Open an existing store: Engine::open(None) reopens KV + vector (restored from the
+/// persisted schema) + automatic recover.
 ///
 /// # Safety
-/// path 须为合法 C 字符串；store 须经 fs_store_create 先建。out 接收句柄。
+/// `path` must be a valid C string; the store must have been created with fs_store_create
+/// first. `out` receives the handle.
 #[no_mangle]
 pub unsafe extern "C" fn fs_store_open(path: *const c_char, out: *mut *mut FsStoreHandle) -> c_int {
     if path.is_null() || out.is_null() {
@@ -128,17 +135,18 @@ pub unsafe extern "C" fn fs_store_open(path: *const c_char, out: *mut *mut FsSto
     OK
 }
 
-/// 关闭句柄，释放堆内存。
+/// Close the handle and free heap memory.
 ///
 /// # Safety
-/// h 须为 fs_store_create/open 返回的合法指针，或 NULL（NULL 时 no-op）。
+/// `h` must be a valid pointer returned by fs_store_create/open, or NULL (NULL is a no-op).
 #[no_mangle]
 pub unsafe extern "C" fn fs_store_close(h: *mut FsStoreHandle) {
     if !h.is_null() {
         let boxed = Box::from_raw(h);
-        // A6/E5：drop 前有序落盘（flush + heed sync + checkpoint），免正常退出丢数据。
-        // C-ABI 签名为 void 无法回传错误码，故 engine close 的 Err 在此记 error 日志
-        // （非吞没——Rust 内部消费方调 Engine::close 拿到 Result，C 侧仅日志可见）。
+        // A6/E5: orderly persistence before drop (flush + heed sync + checkpoint) so a normal
+        // exit never loses data. The C-ABI signature is void and cannot return an error code,
+        // so engine close Err is logged here as an error (not swallowed — internal Rust
+        // consumers call Engine::close and get a Result; on the C side only the log shows it).
         if let Err(e) = boxed.engine.close() {
             tracing::error!(err = ?e, "fs_store_close: engine close FAILED — data may not be fully persisted");
         }
@@ -146,10 +154,10 @@ pub unsafe extern "C" fn fs_store_close(h: *mut FsStoreHandle) {
     }
 }
 
-/// 写 KV。
+/// Write KV.
 ///
 /// # Safety
-/// key/val 须有效（klen/vlen 字节）；h 非空。
+/// `key`/`val` must be valid for klen/vlen bytes; `h` must not be null.
 #[no_mangle]
 pub unsafe extern "C" fn fs_store_put_kv(
     h: *mut FsStoreHandle,
@@ -173,13 +181,14 @@ pub unsafe extern "C" fn fs_store_put_kv(
     }
 }
 
-/// 零拷贝读 KV → 强制拷贝到 caller buffer（E3）。
-/// out_val = caller 预分配 buffer（容量 >= vlen_out 返回值）；
-/// vlen_out = 实际 value 长度；buffer 不足时返回 ERR_OTHER，vlen_out 写所需长度。
-/// key 不存在：返回 ERR_NOT_FOUND。
+/// Zero-copy KV read -> forced copy into a caller buffer (E3).
+/// out_val = caller-allocated buffer (capacity >= the vlen_out result);
+/// vlen_out = actual value length; if the buffer is too small, returns ERR_OTHER and
+/// writes the required length into vlen_out.
+/// Missing key: returns ERR_NOT_FOUND.
 ///
 /// # Safety
-/// out_val 非空（容量由 caller 保证）；vlen_out 非空。
+/// `out_val` must not be null (capacity guaranteed by the caller); `vlen_out` must not be null.
 #[no_mangle]
 pub unsafe extern "C" fn fs_store_get_kv(
     h: *mut FsStoreHandle,
@@ -212,10 +221,11 @@ pub unsafe extern "C" fn fs_store_get_kv(
     }
 }
 
-/// 插入向量（建库后灌数据用，非 PRD C-ABI 四函数之一，但端到端必需）。
+/// Insert a vector (used for bulk loading after store creation; not one of the PRD's four
+/// C-ABI functions, but required end-to-end).
 ///
 /// # Safety
-/// v 须有效 vlen 个 f32；h 非空。
+/// `v` must be valid for vlen f32 elements; `h` must not be null.
 #[no_mangle]
 pub unsafe extern "C" fn fs_store_insert_vector(
     h: *mut FsStoreHandle,
@@ -237,12 +247,13 @@ pub unsafe extern "C" fn fs_store_insert_vector(
     }
 }
 
-/// KNN 检索（读强制拷贝，E3）。
-/// q = 查询向量（qlen 个 f32），top_k = 取近邻数。
-/// out_ids/out_dists = caller 预分配 buffer（容量 >= top_k），out_n = 实际写入数。
+/// KNN search (forced-copy read, E3).
+/// q = query vector (qlen f32 elements), top_k = number of neighbors to fetch.
+/// out_ids/out_dists = caller-allocated buffers (capacity >= top_k); out_n = number written.
 ///
 /// # Safety
-/// q 须有效 qlen 个 f32；out_ids/out_dists/out_n 非空且容量充足。
+/// `q` must be valid for qlen f32 elements; out_ids/out_dists/out_n must not be null and
+/// must have sufficient capacity.
 #[no_mangle]
 pub unsafe extern "C" fn fs_store_search_knn(
     h: *mut FsStoreHandle,
@@ -275,11 +286,12 @@ pub unsafe extern "C" fn fs_store_search_knn(
     }
 }
 
-/// 删除向量（软删：图节点标 tombstone，向量字节由 compact COW 回收）。
-/// 返回 1=删了存活向量，0=id 不存在或已删（非错误）。
+/// Delete a vector (soft delete: graph node gets a tombstone; vector bytes are reclaimed
+/// by compact COW).
+/// Returns 1 if a live vector was deleted, 0 if the id is missing or already deleted (not an error).
 ///
 /// # Safety
-/// h 非空合法句柄。
+/// `h` must be a valid non-null handle.
 #[no_mangle]
 pub unsafe extern "C" fn fs_store_delete_vector(h: *mut FsStoreHandle, id: u64) -> c_int {
     if h.is_null() {
@@ -301,12 +313,14 @@ pub unsafe extern "C" fn fs_store_delete_vector(h: *mut FsStoreHandle, id: u64) 
     }
 }
 
-/// 按 id 取单向量（强制拷贝到 caller buffer，E3）。id 不存在或已软删 → ERR_NOT_FOUND。
-/// out_val = caller 预分配 buffer（容量 >= dim*sizeof(f32)），vlen_out = 实际写入字节。
-/// buffer 不足时返回 ERR_OTHER，vlen_out 写所需字节。
+/// Fetch a single vector by id (forced copy into a caller buffer, E3).
+/// Missing or soft-deleted id -> ERR_NOT_FOUND.
+/// out_val = caller-allocated buffer (capacity >= dim * sizeof(f32)); vlen_out = bytes written.
+/// If the buffer is too small, returns ERR_OTHER and writes the required bytes into vlen_out.
 ///
 /// # Safety
-/// out_val/vlen_out 非空；out_val 容量由 caller 保证（可用 fs_store_vector_dim 取 dim）。
+/// out_val/vlen_out must not be null; out_val capacity is guaranteed by the caller
+/// (use fs_store_vector_dim to obtain the dim).
 #[no_mangle]
 pub unsafe extern "C" fn fs_store_get_vector(
     h: *mut FsStoreHandle,
@@ -337,13 +351,15 @@ pub unsafe extern "C" fn fs_store_get_vector(
     }
 }
 
-/// 枚举存活（非软删）向量 id，拷贝到 caller 预分配 buffer（#3，E3 强制拷贝）。
-/// out_ids = caller 预分配 buffer（容量 >= cap），out_n = 实际写入数。
-/// 调用方需先查总数：可用一次 capacity=0 调用取 out_n=总需，再分配再调。
-/// 容量不足时返回 ERR_OTHER，out_n 写所需长度。
+/// Enumerate live (non-soft-deleted) vector ids, copied into a caller-allocated buffer
+/// (#3, E3 forced copy).
+/// out_ids = caller-allocated buffer (capacity >= cap); out_n = number written.
+/// To learn the total count first: call once with capacity=0 to get out_n = required total,
+/// then allocate and call again.
+/// If capacity is insufficient, returns ERR_OTHER and writes the required length into out_n.
 ///
 /// # Safety
-/// out_ids/out_n 非空；out_ids 容量由 caller 保证。
+/// out_ids/out_n must not be null; out_ids capacity is guaranteed by the caller.
 #[no_mangle]
 pub unsafe extern "C" fn fs_store_list_vector_ids(
     h: *mut FsStoreHandle,
@@ -371,10 +387,10 @@ pub unsafe extern "C" fn fs_store_list_vector_ids(
     }
 }
 
-/// 返回句柄的向量维度（供 caller 校验 buffer 大小）。0=出错或空。
+/// Return the handle's vector dimension (so callers can size buffers). 0 = error or empty.
 ///
 /// # Safety
-/// h 须非空合法句柄。
+/// `h` must be a valid non-null handle.
 #[no_mangle]
 pub unsafe extern "C" fn fs_store_vector_dim(h: *const FsStoreHandle) -> usize {
     if h.is_null() {
@@ -387,11 +403,12 @@ pub unsafe extern "C" fn fs_store_vector_dim(h: *const FsStoreHandle) -> usize {
     }
 }
 
-/// checkpoint：图 snapshot + KV 段 flush + WAL marker 推进 applied_seq + 截断 WAL [v2 H1/L6]。
-/// close 前调此，重开方可从 snapshot 恢复 + WAL 已截断不重放。
+/// Checkpoint: graph snapshot + KV segment flush + WAL marker advancing applied_seq + WAL
+/// truncation [v2 H1/L6].
+/// Call this before close so a reopen restores from the snapshot and the truncated WAL is not replayed.
 ///
 /// # Safety
-/// h 须非空合法句柄。
+/// `h` must be a valid non-null handle.
 #[no_mangle]
 pub unsafe extern "C" fn fs_store_checkpoint(h: *mut FsStoreHandle) -> c_int {
     if h.is_null() {
@@ -409,10 +426,11 @@ pub unsafe extern "C" fn fs_store_checkpoint(h: *mut FsStoreHandle) -> c_int {
 
 #[cfg(test)]
 mod tests {
-    //! fs-ffi-c C-ABI 端到端测试 [v2 §3.4/E3/E4]
+    //! fs-ffi-c C-ABI end-to-end tests [v2 §3.4/E3/E4]
     //!
-    //! 验收（plan M3）：C 接口 fs_store_search_knn 端到端通；读路径强制拷贝（E3）；
-    //! put_kv/get_kv 往返；create→close→open 重开持久化。真实 mmap 段，非 mock（E4）。
+    //! Acceptance (plan M3): C interface fs_store_search_knn works end-to-end; read path is
+    //! forced-copy (E3); put_kv/get_kv roundtrip; create->close->open reopen persistence.
+    //! Real mmap segments, no mocks (E4).
 
     use super::*;
     use std::ffi::CString;
@@ -475,7 +493,7 @@ mod tests {
 
     #[test]
     fn read_is_forced_copy_ids_dists_owned() {
-        // E3：out_ids/out_dists 是 caller-owned buffer，close 后仍可读（非 mmap view）
+        // E3: out_ids/out_dists are caller-owned buffers, still readable after close (not mmap views)
         let dir = tempdir().unwrap();
         let path = c_path(dir.path());
         let dim = 2usize;
@@ -564,7 +582,7 @@ mod tests {
                 let h = create_store(&path, dim);
                 let v = vec![5.0f32; dim];
                 fs_store_insert_vector(h, 42, v.as_ptr(), dim);
-                // 图 checkpoint 落盘，重开方可从 snapshot 恢复（H1）
+                // Persist the graph checkpoint so a reopen restores from the snapshot (H1)
                 let rc = fs_store_checkpoint(h);
                 assert_eq!(rc, 0, "checkpoint failed: {}", rc);
                 fs_store_close(h);
@@ -593,7 +611,7 @@ mod tests {
 
     #[test]
     fn delete_vector_then_get_and_list() {
-        // #2/#3：delete_vector 软删 → get_vector 返回 NOT_FOUND，list_vector_ids 排除之
+        // #2/#3: delete_vector soft delete -> get_vector returns NOT_FOUND, list_vector_ids excludes it
         let dir = tempdir().unwrap();
         let path = c_path(dir.path());
         let dim = 4usize;
@@ -604,14 +622,14 @@ mod tests {
                 v[0] = i as f32;
                 fs_store_insert_vector(h, i, v.as_ptr(), dim);
             }
-            // list 应有 5 个 id
+            // list should return 5 ids
             let mut n = 0usize;
             let mut ids = vec![0u64; 8];
             let rc = fs_store_list_vector_ids(h, ids.as_mut_ptr(), 8, &mut n);
             assert_eq!(rc, 0, "list_vector_ids failed: {}", rc);
             assert_eq!(n, 5, "5 live ids before delete");
 
-            // get id=2 应成功
+            // get id=2 should succeed
             let mut got = vec![0.0f32; dim];
             let mut vlen = 0usize;
             let rc = fs_store_get_vector(h, 2, got.as_mut_ptr(), dim, &mut vlen);
@@ -621,20 +639,20 @@ mod tests {
             // delete id=2
             let rc = fs_store_delete_vector(h, 2);
             assert_eq!(rc, 0, "delete_vector(2) ok");
-            // 再删 id=2 → NOT_FOUND（已软删）
+            // delete id=2 again -> NOT_FOUND (already soft-deleted)
             let rc = fs_store_delete_vector(h, 2);
             assert_eq!(rc, -3, "delete again -> ERR_NOT_FOUND, got {}", rc);
-            // 删不存在的 id=99 → NOT_FOUND
+            // delete nonexistent id=99 -> NOT_FOUND
             let rc = fs_store_delete_vector(h, 99);
             assert_eq!(rc, -3, "delete missing -> ERR_NOT_FOUND");
 
-            // get id=2 删后 → NOT_FOUND
+            // get id=2 after delete -> NOT_FOUND
             let mut got2 = vec![0.0f32; dim];
             let mut vlen2 = 0usize;
             let rc = fs_store_get_vector(h, 2, got2.as_mut_ptr(), dim, &mut vlen2);
             assert_eq!(rc, -3, "get deleted -> ERR_NOT_FOUND, got {}", rc);
 
-            // list 应排除 id=2，剩 4 个
+            // list should exclude id=2, leaving 4
             let mut n2 = 0usize;
             let mut ids2 = vec![0u64; 8];
             let rc = fs_store_list_vector_ids(h, ids2.as_mut_ptr(), 8, &mut n2);
@@ -648,7 +666,7 @@ mod tests {
 
     #[test]
     fn list_vector_ids_capacity_probe() {
-        // 先 capacity=0 探总数，再分配再调（两段式调用模式）
+        // Probe the total with capacity=0 first, then allocate and call again (two-phase pattern)
         let dir = tempdir().unwrap();
         let path = c_path(dir.path());
         let dim = 2usize;
@@ -658,14 +676,15 @@ mod tests {
                 let v = [i as f32, 0.0];
                 fs_store_insert_vector(h, i, v.as_ptr(), dim);
             }
-            // 第一段：cap=0 取所需（len=0 的 vec.as_mut_ptr() 是非空对齐悬垂指针，
-            // 过 is_null 检查；cap=0 < ids.len() 触 ERR_OTHER 并写 out_n=所需总数）
+            // Phase 1: cap=0 to learn the requirement (a len=0 vec.as_mut_ptr() is a non-null,
+            // aligned dangling pointer that passes the is_null check; cap=0 < ids.len() triggers
+            // ERR_OTHER and writes out_n = required total)
             let mut need = 0usize;
             let mut zero: Vec<u64> = Vec::new();
             let rc = fs_store_list_vector_ids(h, zero.as_mut_ptr(), 0, &mut need);
             assert_eq!(rc, -99, "cap=0 -> ERR_OTHER, got {}", rc);
             assert_eq!(need, 7, "need == 7");
-            // 第二段：足量分配
+            // Phase 2: allocate enough and call again
             let mut ids = vec![0u64; need];
             let mut n = 0usize;
             let rc = fs_store_list_vector_ids(h, ids.as_mut_ptr(), need, &mut n);

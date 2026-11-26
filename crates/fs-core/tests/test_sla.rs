@@ -1,8 +1,8 @@
-//! 写吞吐 SLA 验收 [v2 H5/M4d]
+//! Write throughput SLA acceptance [v2 H5/M4d]
 //!
-//! PRD §1.5：批量插入 ≥ 10K vectors/s；单条 put_kv ≥ 5K ops/s。
-//! WAL fsync 唯一 crash-safe 路径，mmap 延迟刷（H5）。
-//! 真实计时（E4 不 mock），N 取可接受范围测速率，断言达标。
+//! PRD §1.5: batch insert ≥ 10K vectors/s; single put_kv ≥ 5K ops/s.
+//! WAL fsync is the single crash-safe path, mmap flushed lazily (H5).
+//! Real timing (E4, no mocks), N chosen within an acceptable range to measure rate, asserting the target is met.
 
 use std::time::Instant;
 
@@ -13,9 +13,9 @@ use tempfile::tempdir;
 
 #[test]
 fn sla_single_put_kv_meets_5k_ops() {
-    // 单条 put_kv 吞吐 ≥ 5K ops/s（WAL 唯一同步点，非每写 msync）
-    // 吞吐 SLA 是 release 优化指标 —— debug 未优化构建不达标属正常（cargo test 默认 debug）。
-    // debug 下只测不断言（打印实测值），release 下（cargo test --release / CI）严格断言。
+    // Single put_kv throughput ≥ 5K ops/s (WAL as the single sync point, not msync per write)
+    // Throughput SLA is a release-optimized metric — unoptimized debug builds missing it is normal (cargo test defaults to debug).
+    // Debug only measures (prints the measured value), release (cargo test --release / CI) asserts strictly.
     let dir = tempdir().unwrap();
     let store = KvStore::open(dir.path(), 0, 0).unwrap();
     let n = 2000u64;
@@ -37,12 +37,12 @@ fn sla_single_put_kv_meets_5k_ops() {
 
 #[test]
 fn sla_batch_insert_meets_10k_vecs() {
-    // 批量 insert_batch ≥ 10K vectors/s（dim=768）
-    // PRD R1：消费方攒批后调 insert_batch 一次提交。现实批大小 100-500。
-    // 验收测单批 100（PRD R1 批大小下界）一次提交吞吐 —— 对应现实调用模式。
-    // 单大批（N≥500）因 NSW 图随批内规模增长，吞吐随 N 降（见 examples/sla_probe：
-    // n=100→16K/s, n=500→5.9K, n=1000→4K）。大批低于 10K 是 NSW 构建固有成本，
-    // 非缺陷；消费方按 R1 用 ~100 批即达标。此处单批 100 留 60% 余量抗并行测试争用。
+    // Batch insert_batch ≥ 10K vectors/s (dim=768)
+    // PRD R1: consumers accumulate a batch then submit once via insert_batch. Realistic batch size 100-500.
+    // Acceptance measures single-batch 100 (PRD R1 batch-size lower bound) submitted once — matching the realistic call pattern.
+    // One large batch (N≥500) slows throughput as the NSW graph grows with in-batch size (see examples/sla_probe:
+    // n=100→16K/s, n=500→5.9K, n=1000→4K). Large batches under 10K are an inherent NSW build cost,
+    // not a defect; consumers using ~100-sized batches per R1 meet the SLA. Single batch of 100 here keeps 60% headroom against parallel-test contention.
     let dir = tempdir().unwrap();
     let schema = VectorSchema::new(768, MetricKind::L2);
     let idx = VectorIndex::open(dir.path(), schema, 0).unwrap();
@@ -57,8 +57,8 @@ fn sla_batch_insert_meets_10k_vecs() {
     let vps = batch_size as f64 / elapsed;
     tracing::info!(batch_size, elapsed, vps, "sla batch insert measured");
     println!("sla batch: {batch_size} vecs in {elapsed:.3}s = {vps:.0} vecs/s");
-    // 吞吐 SLA 是 release 优化指标；debug 未优化 NSW 构建慢，断言会假阴。
-    // debug 下只测不断言，release 下（--release / CI）严格断言（~16K/s，60% 余量）。
+    // Throughput SLA is a release-optimized metric; unoptimized debug makes NSW build slow, assertions would false-negative.
+    // Debug only measures, release (--release / CI) asserts strictly (~16K/s, 60% headroom).
     #[cfg(not(debug_assertions))]
     assert!(
         vps >= 10000.0,

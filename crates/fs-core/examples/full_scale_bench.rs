@@ -1,12 +1,12 @@
-//! 全规模基准 [v2 PRD §2.5 / PRD-plan §657 / README:133]
+//! Full-scale benchmark [v2 PRD §2.5 / PRD-plan §657 / README:133]
 //!
-//! 1M×768 稳态写入 + 召回 vs 暴力 top-10 + KNN p99 延迟。
-//! 规模经 env 配置：FS_BENCH_N（默认 2000 小验）、FS_BENCH_DIM（默认 128）、
-//! FS_BENCH_TOP_K（默认 10）。全规模：`FS_BENCH_N=1000000 FS_BENCH_DIM=768 cargo run --release --example full_scale_bench`。
-//! 真实构建图 + 真实检索（E4 非 mock）。非 CI 阻塞（§657），人工/定期跑。
+//! 1M×768 steady-state writes + recall vs brute-force top-10 + KNN p99 latency.
+//! Scale via env: FS_BENCH_N (default 2000 small check), FS_BENCH_DIM (default 128),
+//! FS_BENCH_TOP_K (default 10). Full scale: `FS_BENCH_N=1000000 FS_BENCH_DIM=768 cargo run --release --example full_scale_bench`.
+//! Real graph build + real search (E4, no mocks). Not a CI blocker (§657); run manually/periodically.
 //!
-//! 验收（PRD §2.5）：召回率 ≥ 0.95、p99 < 5ms。小规模默认可验趋势；全规模达标需 release + 充足 RAM。
-//! 输出打印每项实测值 + pass/fail，不达标 exit 1（供基准门禁按需启用）。
+//! Acceptance (PRD §2.5): recall ≥ 0.95, p99 < 5ms. The small default verifies trends; full-scale passing requires release + ample RAM.
+//! Output prints each measured value + pass/fail; exit 1 on failure (benchmark gate can opt in).
 
 use std::time::{Duration, Instant};
 
@@ -57,7 +57,7 @@ fn main() {
     let idx = VectorIndex::open(dir.path(), schema, 0).unwrap();
     let vecs = gen_vectors(n, dim, 42);
 
-    // 稳态写入吞吐：分批 insert_batch（批 100，PRD R1 现实调用模式）
+    // Steady-state write throughput: chunked insert_batch (batch 100, PRD R1 realistic call pattern)
     let batch_size = 100usize.min(n);
     let t_write = Instant::now();
     let mut id = 0u64;
@@ -76,7 +76,7 @@ fn main() {
     let write_vps = n as f64 / write_secs;
     println!("write: {n} vecs in {write_secs:.2}s = {write_vps:.0} vecs/s (batch {batch_size})");
 
-    // 召回 vs 暴力 top-k：取若干查询点，每点暴力算 top-k 重合率
+    // Recall vs brute-force top-k: sample query points, brute-force top-k overlap per point
     let n_queries = 20usize.min(n);
     let mut recalls = Vec::with_capacity(n_queries);
     for qi in 0..n_queries {
@@ -99,7 +99,7 @@ fn main() {
         n_queries
     );
 
-    // KNN p99 延迟
+    // KNN p99 latency
     let n_lat = 100usize.min(n);
     let mut latencies = Vec::with_capacity(n_lat);
     for q in vecs.iter().take(n_lat) {
@@ -116,7 +116,7 @@ fn main() {
         latencies.len()
     );
 
-    // 图常驻 RAM（§776 #9 评估基建）
+    // Graph resident RAM (§776 #9 evaluation infrastructure)
     let graph_mem = idx.graph_memory_usage();
     println!(
         "graph_memory: {:.1} MB ({} nodes)",
@@ -124,10 +124,10 @@ fn main() {
         idx.len()
     );
 
-    // 验收门禁（PRD §2.5）：召回 ≥ 0.95、p99 < 5ms —— 全规模（N≥1M）指标。
-    // NSW 召回随 N 增（图更连通）；小规模 N 召回自然偏低（2000×128 ~0.92 正常）。
-    // 故门禁按 N 分档：N≥100K 严格 0.95；N<100K 放宽 0.90（验趋势，非全规模达标）。
-    // 全规模达标需 release + 充足 RAM；debug 下 NSW 未优化，门禁跳过（仅打印）。
+    // Acceptance gate (PRD §2.5): recall ≥ 0.95, p99 < 5ms — full-scale (N≥1M) metrics.
+    // NSW recall grows with N (graph gets more connected); small-N recall is naturally lower (2000×128 ~0.92 is normal).
+    // So the gate tiers by N: N≥100K strict 0.95; N<100K relaxed 0.90 (trend check, not full-scale acceptance).
+    // Full-scale passing requires release + ample RAM; NSW unoptimized in debug, gate skipped (print only).
     let recall_gate = if n >= 100_000 { 0.95 } else { 0.90 };
     let mut ok = true;
     if cfg!(not(debug_assertions)) {

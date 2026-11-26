@@ -1,10 +1,10 @@
-//! 向量库 schema —— 建库时锁定 dim/metric/ef_search 强不变量 [v2 E2]
+//! Vector index schema — locks dim/metric/ef_search as strong invariants at creation [v2 E2]
 
 use serde::{Deserialize, Serialize};
 
 use crate::vector::nsw::DEFAULT_EF_SEARCH;
 
-/// 距离度量类型（建库时固定一种）
+/// Distance metric kind (fixed to one at index creation)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MetricKind {
     Cosine,
@@ -12,11 +12,15 @@ pub enum MetricKind {
     Dot,
 }
 
-/// 向量库 schema —— insert/search 校验维度一致，不符报 DimensionMismatch [v2 E2]
+/// Vector index schema — insert/search validate dimension consistency and
+/// report DimensionMismatch on mismatch [v2 E2]
 ///
-/// F-ARCH-2：`ef_search` 建库时锁定，检索经此值定候选集宽度（与 top_k 取大者）。
-/// 默认 200（达 PRD §2.5 ≥0.95 召回 SLA）；建库时可调（高召回场景调高、低延迟场景调低）。
-/// serde default：旧 snapshot/schema 未持久化此字段时回落 DEFAULT_EF_SEARCH（向后兼容）。
+/// F-ARCH-2: `ef_search` is locked at index creation; search uses this value
+/// (or top_k, whichever is larger) as the candidate-set width.
+/// Default is 200 (meets the PRD §2.5 ≥0.95 recall SLA); tunable at creation
+/// (raise for high-recall workloads, lower for low-latency ones).
+/// serde default: falls back to DEFAULT_EF_SEARCH when older snapshots/schemas
+/// did not persist this field (backward compatible).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VectorSchema {
     pub dim: usize,
@@ -38,7 +42,7 @@ impl VectorSchema {
         }
     }
 
-    /// 显式指定 ef_search 建库（F-ARCH-2）。0 或缺失回落默认。
+    /// Create with an explicit ef_search (F-ARCH-2). Falls back to the default for 0 or missing.
     pub fn with_ef_search(dim: usize, metric: MetricKind, ef_search: usize) -> Self {
         Self {
             dim,
@@ -51,7 +55,7 @@ impl VectorSchema {
         }
     }
 
-    /// 校验向量维度与 schema 一致，不符返回 DimensionMismatch [v2 E2]
+    /// Validate vector dimension against the schema; returns DimensionMismatch on mismatch [v2 E2]
     pub fn validate_dim(&self, vector: &[f32]) -> crate::Result<()> {
         if vector.len() == self.dim {
             Ok(())

@@ -1,24 +1,31 @@
-//! Engine —— 聚合 KV + Vector + Columnar + WAL 的引擎层 [F1/F2/A1]
+//! Engine — the engine layer aggregating KV + Vector + Columnar + WAL [F1/F2/A1]
 //!
-//! 落地 PRD §1.4 的 `FusionStoreEngine` trait：`Engine` 是唯一实现者，聚合
-//! `KvStore` + `VectorIndex` + `ColumnarStore` + `Wal`。所有外部入口（fs-cli /
-//! fs-serve / fs-ffi-c / fs-ffi-py）持有 `Engine`，不再裸持子模块。
+//! Implements the PRD §1.4 `FusionStoreEngine` trait: `Engine` is the sole implementer,
+//! aggregating `KvStore` + `VectorIndex` + `ColumnarStore` + `Wal`. All external entry
+//! points (fs-cli / fs-serve / fs-ffi-c / fs-ffi-py) hold an `Engine` and never touch
+//! submodules directly.
 //!
-//! WAL 接入写路径（F2）：put_kv/insert/insert_batch/put_columnar/delete 先
-//! `wal.append`（fsync，crash-safe 唯一同步点）→ 再调子模块落 mmap 段 + heed。
-//! PRD H5：WAL 唯一同步点，mmap 段延迟刷，heed NO_SYNC。崩溃后 `Engine::open`
-//! 调 `build_recover_plan` → 重放 seq > applied_seq 的 WalOp（逻辑 payload，
-//! 幂等：insert 查 dup 跳过，put_kv 覆盖，delete 幂等）→ `finalize_recover` 截断。
+//! WAL in the write path (F2): put_kv/insert/insert_batch/put_columnar/delete first
+//! `wal.append` (fsync, the sole crash-safe sync point) → then call submodules to land
+//! mmap segments + heed.
+//! PRD H5: the WAL is the only sync point, mmap segments flush lazily, heed NO_SYNC.
+//! After a crash, `Engine::open` calls `build_recover_plan` → replays WalOps with
+//! seq > applied_seq (logical payloads, idempotent: insert skips dups, put_kv overwrites,
+//! delete is idempotent) → `finalize_recover` truncates.
 //!
-//! 单 namespace = 一个 Engine 实例。
+//! One namespace = one Engine instance.
 //!
-//! A4 诚实定位：Engine **不支持**单引擎内多 namespace 路由/多租户隔离。每个 namespace
-//! 需独立 `Engine::open(<ns_dir>, ...)` 实例 = 独立目录 + 独立 WAL + 独立 heed env +
-//! 独立 flock（A1/E13 跨进程互斥按 namespace 粒度）。多 namespace 协调（如 fusion-memory
-//! 同时读写多 namespace）是**消费方职责**——应用层自行管理多 Engine 句柄。fusion-store
-//! 不在单引擎内提供多租户配额共享或 namespace 路由层，也不承诺该能力；定位是
-//! 「单 namespace 零拷贝存储引擎」，非多租户引擎。namespace 数量增长时 fd/mmap/进程数
-//! 随之膨胀，触及 macOS 系统上限由消费方控制。
+//! A4 honest positioning: the Engine does **not** support multi-namespace routing or
+//! multi-tenant isolation inside a single engine. Each namespace needs its own
+//! `Engine::open(<ns_dir>, ...)` instance = independent directory + independent WAL +
+//! independent heed env + independent flock (A1/E13 cross-process exclusion at namespace
+//! granularity). Multi-namespace coordination (e.g. fusion-memory reading/writing several
+//! namespaces) is the **consumer's responsibility** — the application manages multiple
+//! Engine handles itself. fusion-store does not provide multi-tenant quota sharing or a
+//! namespace routing layer inside one engine, and does not promise that capability; the
+//! positioning is "single-namespace zero-copy storage engine", not a multi-tenant engine.
+//! As namespace count grows, fd/mmap/process counts grow with it; hitting macOS system
+//! limits is the consumer's concern.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -38,7 +45,7 @@ use crate::engine::ZeroCopyArrowBatch;
 #[cfg(feature = "columnar")]
 use arrow::record_batch::RecordBatch as ArrowRecordBatch;
 
-/// 引擎实例 —— 聚合三类存储 + WAL
+/// Engine instance — aggregates the three storage types + WAL
 pub struct Engine {
     kv: KvStore,
     vec: Mutex<Option<VectorIndex>>,
@@ -49,23 +56,23 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// 打开/创建引擎。home = namespace 根目录。
-    /// 子目录：kv/ + vec/ + col/(列式) + wal/。
-    /// schema=Some → 新建向量索引（锁定 dim）；None → 重开已存在索引。
-    /// 打开后自动 recover（重放未 checkpoint 的 WAL，幂等）。
+    /// Open/create the engine. home = namespace root directory.
+    /// Subdirectories: kv/ + vec/ + col/ (columnar) + wal/.
+    /// schema=Some → create a new vector index (dim locked); None → reopen an existing one.
+    /// Automatically recovers after open (replays un-checkpointed WAL, idempotent).
     pub fn open(home: &Path, schema: Option<VectorSchema>, quota_limit: u64) -> Result<Self> {
         let home = home.to_path_buf();
         let kv_dir = home.join("kv");
         let vec_dir = home.join("vec");
         let wal_dir = home.join("wal");
         std::fs::create_dir_all(&home)?;
-        // kv 段默认 64MB；配额 0=不限
+        // kv segments default 64MB; quota 0 = unlimited
         let kv = KvStore::open(&kv_dir, 0, quota_limit)?;
-        // 向量索引：Some 建（锁 schema），None 重开（无已存在索引则 None）
+        // Vector index: Some builds (schema locked), None reopens (None when no index exists)
         let vec_idx = match schema {
             Some(s) => Some(VectorIndex::open(&vec_dir, s, 0)?),
             None => {
-                // vec_meta 存在才 reopen；否则不建索引
+                // Reopen only when vec_meta exists; otherwise no index is created
                 if vec_dir.join("vec_meta").exists() {
                     Some(VectorIndex::reopen(&vec_dir, 0)?)
                 } else {
@@ -73,7 +80,7 @@ impl Engine {
                 }
             }
         };
-        // 列式按需开（首次 put_columnar 时建），此处 None
+        // Columnar opens lazily (created on first put_columnar); None here
         let col = None;
         let wal = Wal::open(&wal_dir)?;
         let engine = Self {
@@ -84,13 +91,13 @@ impl Engine {
             home: home.clone(),
             quota_limit,
         };
-        // 打开即 recover：重放未 checkpoint 的 WAL（A1）
+        // Recover right at open: replay the un-checkpointed WAL (A1)
         engine.recover_inner()?;
         tracing::info!(home = ?home, "engine opened + recovered");
         Ok(engine)
     }
 
-    /// 仅打开 KV（无向量索引场景）
+    /// Open KV only (no vector index scenarios)
     pub fn open_kv_only(home: &Path, quota_limit: u64) -> Result<Self> {
         Self::open(home, None, quota_limit)
     }
@@ -99,10 +106,12 @@ impl Engine {
         &self.home
     }
 
-    /// 读当前待重放 WAL 计划（经已开 Wal，不重开抢 flock）。
-    /// A1：Wal::open 持阻塞排他 flock；外部 `build_recover_plan` 会重开 Wal →
-    /// 与本 Engine 持有的 Wal 死锁。故持 Engine 时只能经此方法读 plan，
-    /// 不能调裸 `build_recover_plan(&wal_dir)`。
+    /// Read the current pending WAL replay plan (via the already-open Wal, no reopen that
+    /// would race the flock).
+    /// A1: Wal::open holds a blocking exclusive flock; the external `build_recover_plan`
+    /// would reopen the Wal → deadlock with the Wal this Engine holds. While holding an
+    /// Engine, read the plan only through this method — never call bare
+    /// `build_recover_plan(&wal_dir)`.
     pub fn pending_recover_plan(&self) -> Result<crate::mem::RecoverPlan> {
         let wal = self
             .wal
@@ -123,13 +132,14 @@ impl Engine {
         })
     }
 
-    /// KV 子模块直引用（FFI/CLI 读配额/统计用）
+    /// Direct reference to the KV submodule (FFI/CLI read quota/stats)
     pub fn kv(&self) -> &KvStore {
         &self.kv
     }
 
-    /// 全引擎实际磁盘占用 = kv 段 + vec 段 + col 段（P3：真实占用，含 padding/段尾空洞）。
-    /// 各子模块按已开与否求和，未开的子模块计 0（不报错）。
+    /// Whole-engine actual disk usage = kv segments + vec segments + col segments
+    /// (P3: real usage, including padding/segment tail holes).
+    /// Sums each submodule that is open; unopened submodules count 0 (no error).
     pub fn disk_bytes(&self) -> Result<u64> {
         let mut total: u64 = 0;
         total += self.kv.disk_bytes()?;
@@ -146,7 +156,7 @@ impl Engine {
         Ok(total)
     }
 
-    /// 向量索引引用（FFI/CLI 读 schema/count 用）—— 持锁返回 guard
+    /// Vector index reference (FFI/CLI read schema/count) — returns the guard under lock
     pub fn vec_index(&self) -> Result<std::sync::MutexGuard<'_, Option<VectorIndex>>> {
         let g = self
             .vec
@@ -180,11 +190,13 @@ impl Engine {
         Ok(g)
     }
 
-    /// recover 实现：build_recover_plan → 逐条幂等重放 → finalize_recover
+    /// Recover implementation: build_recover_plan → idempotent replay entry by entry → finalize_recover
     fn recover_inner(&self) -> Result<()> {
-        // 复用已开 Wal（A1：Wal::open 持阻塞排他 flock，不可再开第二个实例，否则死锁）。
-        // build_recover_plan/finalize_recover 会 Wal::open 重开 → 与 Engine 持有的 Wal 抢同
-        // 一把 flock → 第二个 open 永久阻塞。故在此直接读已开 Wal，不走重开路径。
+        // Reuse the already-open Wal (A1: Wal::open holds a blocking exclusive flock;
+        // a second instance would deadlock).
+        // build_recover_plan/finalize_recover would Wal::open again → contend for the same
+        // flock as the Engine's Wal → the second open blocks forever. So read the open Wal
+        // directly here, never via the reopen path.
         let (applied_seq, entries) = {
             let wal = self
                 .wal
@@ -210,7 +222,7 @@ impl Engine {
             self.replay_op(&entry.op)?;
             max_seq = max_seq.max(entry.seq);
         }
-        // 重放成功后截断 WAL 到 max_seq（复用已开 Wal）
+        // Truncate the WAL to max_seq after successful replay (reusing the open Wal)
         {
             let mut wal = self
                 .wal
@@ -226,7 +238,8 @@ impl Engine {
         Ok(())
     }
 
-    /// 单条 WAL op 幂等重放。insert dup → 跳过（已 applied）；其余直接调子模块。
+    /// Idempotent replay of a single WAL op. insert dup → skip (already applied);
+    /// everything else goes straight to the submodule.
     fn replay_op(&self, op: &WalOp) -> Result<()> {
         match op {
             WalOp::PutKv { key, value } => self.kv.put_kv(key, value, None),
@@ -274,7 +287,7 @@ impl Engine {
 
 impl FusionStoreEngine for Engine {
     fn put_kv(&self, key: &[u8], value: &[u8], timeout: Option<Duration>) -> Result<()> {
-        // F2：先记 WAL（fsync 唯一同步点）→ 再落 mmap 段 + heed
+        // F2: log the WAL first (fsync, the sole sync point) → then land mmap segment + heed
         {
             let mut wal = self
                 .wal
@@ -308,7 +321,8 @@ impl FusionStoreEngine for Engine {
     }
 
     fn create_vector_index(&self, name: &str, schema: VectorSchema) -> Result<()> {
-        // 单 namespace 单向量索引：name 仅作日志，实际建在 vec/ 下
+        // Single namespace, single vector index: name is logging-only; the index actually
+        // lives under vec/
         let _ = name;
         let vec_dir = self.home.join("vec");
         let idx = VectorIndex::open(&vec_dir, schema, 0)?;
@@ -327,10 +341,12 @@ impl FusionStoreEngine for Engine {
     }
 
     fn insert_vector(&self, id: u64, vector: &[f32], timeout: Option<Duration>) -> Result<()> {
-        // F2：先 WAL（payload 完整 vector）→ 再落段连边
-        // E13：跨进程安全由 Wal::open 持的 namespace 排他 flock 保证（A1）——
-        // 第二进程无法 open 同 namespace，向量写不会与另一进程交错。
-        // 进程内并发由 Wal Mutex（append 串行）+ VectorIndex RwLock（insert 写锁）串行。
+        // F2: WAL first (payload is the full vector) → then land segment + link edges
+        // E13: cross-process safety comes from the namespace exclusive flock held by
+        // Wal::open (A1) — a second process cannot open the same namespace, so vector
+        // writes never interleave with another process.
+        // In-process concurrency is serialized by the Wal Mutex (serial appends) + the
+        // VectorIndex RwLock (insert write lock).
         {
             let mut wal = self
                 .wal
@@ -350,8 +366,10 @@ impl FusionStoreEngine for Engine {
         items: &[(u64, &[f32])],
         timeout: Option<Duration>,
     ) -> Result<()> {
-        // E2：整批单次 WAL append+fsync（group commit），替代旧逐条 fsync。
-        // 批次原子性：fsync 前崩 → 整批丢（torn tail 容错）；fsync 后 → 整批持久。
+        // E2: the whole batch does one WAL append+fsync (group commit), replacing the old
+        // per-entry fsync.
+        // Batch atomicity: crash before fsync → whole batch lost (torn-tail tolerance);
+        // crash after fsync → whole batch durable.
         {
             let mut wal = self
                 .wal
@@ -381,7 +399,7 @@ impl FusionStoreEngine for Engine {
     }
 
     fn delete_vector(&self, id: u64, timeout: Option<Duration>) -> Result<bool> {
-        // L7：向量删也记 WAL，recover 重放删除
+        // L7: vector deletes are WAL-logged too; recover replays the deletion
         {
             let mut wal = self
                 .wal
@@ -393,7 +411,7 @@ impl FusionStoreEngine for Engine {
         g.as_ref().unwrap().delete(id, timeout)
     }
 
-    // —— 向量读取/枚举（#3，只读不经 WAL）——
+    // —— Vector read/enumeration (#3, read-only, bypasses the WAL) ——
     fn get_vector(&self, id: u64, _timeout: Option<Duration>) -> Result<Option<Vec<f32>>> {
         let g = self.ensure_vec()?;
         g.as_ref().unwrap().get_vector(id)
@@ -411,7 +429,7 @@ impl FusionStoreEngine for Engine {
         batch: &ArrowRecordBatch,
         timeout: Option<Duration>,
     ) -> Result<()> {
-        // F2：WAL 记 IPC（payload）→ 落 col 段
+        // F2: WAL records the IPC (payload) → land in col segments
         let ipc = encode_ipc(batch)?;
         {
             let mut wal = self
@@ -423,7 +441,7 @@ impl FusionStoreEngine for Engine {
                 ipc,
             })?;
         }
-        // 按需建列式 store
+        // Create the columnar store on demand
         if self
             .col
             .lock()
@@ -455,10 +473,12 @@ impl FusionStoreEngine for Engine {
     }
 
     fn checkpoint(&self) -> Result<()> {
-        // A6：顺序严格——先 flush KV + Columnar active 段 + heed force_sync，
-        // 再写向量 snapshot，最后写 WAL marker + 截断。
-        // 若先截断 WAL 后崩溃在 flush 前 → KV 段落后于已截断 WAL → 丢数据。
-        // flush 在前，截断在最后：截断后任一点崩溃，已 flush 的 KV/col 仍完整。
+        // A6: strict ordering — first flush KV + Columnar active segments + heed force_sync,
+        // then write the vector snapshot, and only last write the WAL marker + truncate.
+        // If the WAL were truncated first and the process crashed before flush → KV segments
+        // lag behind the truncated WAL → data loss.
+        // Flush first, truncate last: crashing at any point after truncation still leaves
+        // the already-flushed KV/col data complete.
         let applied_seq = {
             let wal = self
                 .wal
@@ -466,19 +486,19 @@ impl FusionStoreEngine for Engine {
                 .map_err(|_| crate::StoreError::LockPoisoned)?;
             wal.next_seq().saturating_sub(1)
         };
-        // 1. flush KV active 段 + heed force_sync（locators 落盘）
+        // 1. Flush the KV active segment + heed force_sync (locators durable)
         self.kv.flush()?;
-        // 2. flush Columnar active 段 + heed force_sync（若已开）
+        // 2. Flush the Columnar active segment + heed force_sync (if opened)
         if let Ok(g) = self.ensure_col() {
             if let Some(col) = g.as_ref() {
                 col.flush()?;
             }
         }
-        // 3. 向量索引 snapshot（图拓扑 + 软删标记）
+        // 3. Vector index snapshot (graph topology + soft-delete marks)
         if let Ok(g) = self.ensure_vec() {
             g.as_ref().unwrap().checkpoint()?;
         }
-        // 4. WAL marker：applied_seq 推进，recover 不再重放已 checkpoint 部分
+        // 4. WAL marker: applied_seq advances so recover no longer replays checkpointed entries
         let snapshot_name = format!("nsw_checkpoint_{}.mmap", applied_seq);
         let marker = crate::mem::wal::CheckpointMarker {
             applied_seq,
@@ -491,7 +511,7 @@ impl FusionStoreEngine for Engine {
                 .lock()
                 .map_err(|_| crate::StoreError::LockPoisoned)?;
             wal.write_marker(&marker)?;
-            // 5. 最后才截断已 checkpoint 的 WAL 条目
+            // 5. Only now truncate the checkpointed WAL entries
             wal.truncate_to(applied_seq)?;
         }
         tracing::info!(
@@ -505,19 +525,20 @@ impl FusionStoreEngine for Engine {
         self.recover_inner()
     }
 
-    // A6/E5：有序关闭——checkpoint 已含 KV/col flush + vec snapshot + WAL marker/截断。
-    // E5：任一步失败聚合返回 Err，绝不吞没（吞没 = 静默丢数据）。
+    // A6/E5: orderly shutdown — checkpoint already covers KV/col flush + vec snapshot +
+    // WAL marker/truncation.
+    // E5: any step failure aggregates into Err, never swallowed (swallowing = silent data loss).
     fn close(&self) -> Result<()> {
         tracing::info!("engine closing: checkpoint (flush + snapshot + wal)");
-        // checkpoint 失败 → 数据未完整落盘，必须报错（E5：不再 warn 后 Ok）
+        // A failed checkpoint → data not fully durable, must error (E5: no warn-then-Ok)
         self.checkpoint()?;
         tracing::info!("engine closed: all segments flushed + heed synced + wal truncated");
         Ok(())
     }
 }
 
-// —— 列式 IPC 编解码（WAL payload 序列化 RecordBatch）——
-// E10：decode_ipc 暴露为 pub，供 fs-serve HTTP /columnar 端点解码客户端 IPC 字节。
+// —— Columnar IPC codec (WAL payload serializing a RecordBatch) ——
+// E10: decode_ipc is pub so the fs-serve HTTP /columnar endpoint can decode client IPC bytes.
 #[cfg(feature = "columnar")]
 pub fn encode_ipc(batch: &ArrowRecordBatch) -> Result<Vec<u8>> {
     use arrow::ipc::writer::StreamWriter;

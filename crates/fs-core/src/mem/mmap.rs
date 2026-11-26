@@ -1,7 +1,8 @@
-//! mmap 内存管理层 —— 段 append-only 不可变 (H2/H4)
+//! mmap memory management layer — segments are append-only and immutable (H2/H4)
 //!
-//! 核心约束：每个 mmap 段写满封存即只读，永不 truncate/grow/就地改。
-//! reader 持 ZeroCopyBuffer 期间段永不被改大小，根治 SIGBUS 与并发撕裂。
+//! Core constraint: every mmap segment becomes read-only once full and sealed, never
+//! truncated/grown/modified in place. While a reader holds a ZeroCopyBuffer the segment
+//! is never resized, eliminating SIGBUS and concurrent tearing at the root.
 
 use std::fs::File;
 use std::sync::Arc;
@@ -10,11 +11,11 @@ use memmap2::{Mmap, MmapMut};
 
 use crate::error::{Result, StoreError};
 
-/// mmap 段句柄 —— sealed=true 后只读、永不改大小 [v2 H4]
+/// mmap segment handle — read-only and never resized once sealed=true [v2 H4]
 ///
-/// Arc<MmapHandle> 保活即指针永久有效。
+/// Keeping Arc<MmapHandle> alive keeps pointers valid forever.
 pub struct MmapHandle {
-    // file 保活底层文件，防 truncate；不直接读
+    // file keeps the underlying file alive to prevent truncation; never read directly
     #[allow(dead_code)]
     file: File,
     mmap: Mmap,
@@ -22,12 +23,12 @@ pub struct MmapHandle {
     sealed: bool,
 }
 
-// 不可变只读段可跨线程共享
+// Immutable read-only segments can be shared across threads
 unsafe impl Send for MmapHandle {}
 unsafe impl Sync for MmapHandle {}
 
 impl MmapHandle {
-    /// 打开只读映射（封存段）
+    /// Open a read-only mapping (sealed segment)
     pub fn open_read(file: File) -> Result<Self> {
         let mmap = unsafe { Mmap::map(&file)? };
         let len = mmap.len();
@@ -40,7 +41,7 @@ impl MmapHandle {
         })
     }
 
-    /// 从已有 mmap 映射构造（segment.rs 封存段复用已 flush 的映射）
+    /// Build from an existing mmap mapping (segment.rs reuses already-flushed mappings for sealed segments)
     pub fn from_parts(file: File, mmap: Mmap) -> Self {
         Self {
             file,
@@ -50,13 +51,15 @@ impl MmapHandle {
         }
     }
 
-    /// 打开读写映射（当前写段，单写者独占）
+    /// Open a read-write mapping (active write segment, exclusive single writer)
     pub fn open_write(file: File) -> Result<Self> {
         let mmap_mut = unsafe { MmapMut::map_mut(&file)? };
         tracing::debug!(len = mmap_mut.len(), "mmap write segment opened");
-        // F7：旧实现 transmute MmapMut→Mmap 是 UB（两类型布局无保证）。
-        // memmap2 0.9 make_read_only 消费 MmapMut 转 Mmap，安全且语义对（写路径在
-        // segment.rs 单独持 MmapMut 写活跃段，此处仅开只读快照供读侧）。
+        // F7: the old implementation transmuted MmapMut→Mmap, which is UB (no layout
+        // guarantee between the two types). memmap2 0.9 make_read_only consumes MmapMut
+        // into Mmap — safe and semantically correct (the write path in segment.rs keeps
+        // its own MmapMut for the active segment; this only opens a read-only snapshot
+        // for readers).
         let mmap = mmap_mut.make_read_only()?;
         Ok(Self {
             file,
@@ -66,7 +69,7 @@ impl MmapHandle {
         })
     }
 
-    /// 封存：写满后转只读，永不再写 [v2 H4]
+    /// Seal: flip to read-only once full, never written again [v2 H4]
     pub fn seal(&mut self) {
         self.sealed = true;
         tracing::debug!(base = self.base, "segment sealed (read-only forever)");
@@ -84,32 +87,34 @@ impl MmapHandle {
         self.mmap.is_empty()
     }
 
-    /// 返回段内字节切片（零拷贝，段不可变保有效）
+    /// Return the byte slice inside the segment (zero-copy, valid while the segment stays immutable)
     pub fn as_bytes(&self) -> &[u8] {
         &self.mmap[..]
     }
 }
 
-/// 零拷贝 Buffer —— 持有 Arc<MmapHandle> 保活映射 [v2 H4]
+/// Zero-copy buffer — holds Arc<MmapHandle> to keep the mapping alive [v2 H4]
 ///
-/// 段 append-only 不可变 → 指针永久有效，无 SIGBUS。
-/// 需 owned 数据时显式 to_owned_slice()。
+/// Segments are append-only and immutable, so pointers stay valid forever — no SIGBUS.
+/// Call to_owned_slice() explicitly when owned data is needed.
 pub struct ZeroCopyBuffer {
     ptr: *const u8,
     len: usize,
-    // mmap_handle 保活映射段，段不可变保指针有效；借用不可见故 allow dead_code
+    // mmap_handle keeps the mapped segment alive; immutability keeps pointers valid.
+    // Invisible to borrows, hence allow dead_code
     #[allow(dead_code)]
     mmap_handle: Arc<MmapHandle>,
 }
 
-/// 零拷贝 f32 向量切片 —— 持 Arc<MmapHandle> 保活映射 [v2 H1/H4]
+/// Zero-copy f32 vector slice — holds Arc<MmapHandle> to keep the mapping alive [v2 H1/H4]
 ///
-/// 向量距离热路径用：每跳读 mmap 段算距离，零分配零拷贝（非 Vec<f32>）。
-/// 段 append-only 不可变保指针永久有效，Arc 保活映射。
+/// Used on the vector-distance hot path: each hop reads the mmap segment to compute
+/// distances with zero allocation and zero copy (not a Vec<f32>).
+/// Append-only immutable segments keep pointers valid forever; Arc keeps the mapping alive.
 pub struct ZeroCopyVec {
     ptr: *const f32,
     len: usize,
-    // mmap_handle 保活映射段，段不可变保指针有效
+    // mmap_handle keeps the mapped segment alive; immutability keeps pointers valid
     #[allow(dead_code)]
     mmap_handle: Arc<MmapHandle>,
 }
@@ -118,10 +123,11 @@ unsafe impl Send for ZeroCopyVec {}
 unsafe impl Sync for ZeroCopyVec {}
 
 impl ZeroCopyVec {
-    // F6：bounds 校验免越界。返回 Result，offset+len 超 mmap 长度 → Corrupt。
+    // F6: bounds validation prevents out-of-bounds access. Returns Result; offset+len
+    // beyond the mmap length yields Corrupt.
     pub fn new(mmap_handle: Arc<MmapHandle>, offset: usize, len: usize) -> Result<Self> {
         let region_len = mmap_handle.len();
-        // offset 对齐 f32（段 append 按 byte_len=dim*4 对齐，offset 始终 4 倍数）
+        // offset is f32-aligned (segment append uses byte_len=dim*4, so offset is always a multiple of 4)
         let byte_len = len
             .checked_mul(4)
             .ok_or_else(|| StoreError::Corrupt(format!("vector len {} overflow byte size", len)))?;
@@ -152,7 +158,7 @@ impl ZeroCopyVec {
         })
     }
 
-    /// 零拷贝读 f32 切片 —— SIMD 距离直接用，无 Vec 分配
+    /// Zero-copy read of the f32 slice — used directly for SIMD distance, no Vec allocation
     pub fn as_f32(&self) -> &[f32] {
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
@@ -170,7 +176,8 @@ unsafe impl Send for ZeroCopyBuffer {}
 unsafe impl Sync for ZeroCopyBuffer {}
 
 impl ZeroCopyBuffer {
-    // F6：bounds 校验免越界。返回 Result，offset+len 超 mmap 长度 → Corrupt。
+    // F6: bounds validation prevents out-of-bounds access. Returns Result; offset+len
+    // beyond the mmap length yields Corrupt.
     pub fn new(mmap_handle: Arc<MmapHandle>, offset: usize, len: usize) -> Result<Self> {
         let region_len = mmap_handle.len();
         let end = offset.checked_add(len).ok_or_else(|| {
@@ -200,7 +207,7 @@ impl ZeroCopyBuffer {
         })
     }
 
-    /// 零拷贝读字节切片
+    /// Zero-copy read of the byte slice
     pub fn as_bytes(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
@@ -213,7 +220,7 @@ impl ZeroCopyBuffer {
         self.len == 0
     }
 
-    /// 显式拷贝为 owned —— 需 owned 数据时调用
+    /// Explicitly copy to owned — call when owned data is needed
     pub fn to_owned_slice(&self) -> Vec<u8> {
         self.as_bytes().to_vec()
     }
@@ -234,7 +241,7 @@ mod tests {
         assert_eq!(buf.as_bytes(), payload);
         assert!(!buf.is_empty());
         assert_eq!(buf.len(), payload.len());
-        // 零拷贝断言：指针落在 mmap 区域内
+        // Zero-copy assertion: pointer lands inside the mmap region
         let region = handle.as_bytes().as_ptr();
         let buf_ptr = buf.as_bytes().as_ptr();
         assert!(buf_ptr >= region && buf_ptr <= unsafe { region.add(handle.len()) });
