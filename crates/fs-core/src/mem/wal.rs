@@ -10,12 +10,13 @@
 //! overwrites, delete is idempotent).
 //!
 //! Logical WAL (F2 fix): WalOp carries logical payloads (key+value / id+vector /
-//! table+ipc), not physical locators. Rationale: under PRD H5 "WAL as the sole sync point
-//! + lazy mmap flush", a physical-locator WAL would point at an un-fsynced mmap segment
-//! tail after power loss → corruption. Logical payloads let replay re-land segments +
-//! heed through submodule idempotent methods, independent of whether old segment bytes
-//! reached disk. Replay = calling put_kv/insert/put_columnar again, idempotently:
-//! insert checks id existence and skips, put_kv overwrites, delete is idempotent.
+//! table+ipc), not physical locators. Rationale: under PRD H5 "WAL as the sole sync
+//! point plus lazy mmap flush", a physical-locator WAL would point at an un-fsynced
+//! mmap segment tail after power loss, corrupting reads. Logical payloads let replay
+//! re-land segments and heed through submodule idempotent methods, independent of
+//! whether old segment bytes reached disk. Replay = calling put_kv/insert/put_columnar
+//! again, idempotently: insert checks id existence and skips, put_kv overwrites,
+//! delete is idempotent.
 //!
 //! Frame format (fixed-length header + variable-length body):
 //!   [seq:8 LE][op_tag:1][body_len:4 LE][body: body_len]
